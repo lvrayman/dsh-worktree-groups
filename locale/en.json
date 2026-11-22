@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Git worktree groups",
+    "description": "Organizes the sidebar workspace list (sidebar.workspaces) into a 3-level hierarchy (Project → Git worktree → Session). Discovers unregistered worktrees with lazy workspace registration, creates and removes worktrees in place, preserves sessions from deleted worktrees in a history bucket, and supports 3-level drag-and-drop ordering, progressive session expansion, and a Recent activity section."
+  }
+}

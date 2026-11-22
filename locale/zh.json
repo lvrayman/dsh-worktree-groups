@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Git Worktree 三级分组",
+    "description": "接管左侧栏工作区列表（sidebar.workspaces），将会话按「项目 → Git Worktree → 会话」三级树分组；支持自动发现未注册 worktree 与懒注册、一键新建/移除 worktree、已删 worktree 历史会话回收桶、三层拖拽手动排序、渐进式展开及底部「最近」活动分区。"
+  }
+}

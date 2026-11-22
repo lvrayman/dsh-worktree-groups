@@ -1,0 +1,17 @@
+# dsh-worktree-groups 组合包 patch。
+#
+# 本文件由 package.json 的 `dsh.bundle.patch` 声明。profile 启动时，Desktop 会为
+# `dsh.profile.bundles` 里的每个包解析其 `dsh.bundle.patch` 并作为一层 patch 合并
+# （见 app/lib/profile-*.js 的 bundle 层构建逻辑），所以**不需要**手工往 profile 的
+# cordis.patch.yml 里再写一份 insert。
+#
+# 安装（两处都要改 <DSH_HOME>/profiles/web/package.json）：
+#   1. dsh.profile.bundles 追加 "dsh-worktree-groups"
+#   2. dependencies 追加 "dsh-worktree-groups": "link:<本包绝对路径>"
+#   然后 cd <DSH_HOME>/profiles/web && pnpm install
+#
+# 新增 bundle 必须重启 DSH Desktop 才生效（patchReload: "live" 只覆盖 patch 文件
+# 内容的热重载，不含 bundle 层增删）。
+- insert:
+    - id: dsh-worktree-groups
+      name: dsh-worktree-groups

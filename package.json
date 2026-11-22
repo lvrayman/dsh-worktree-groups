@@ -1,0 +1,90 @@
+{
+  "name": "dsh-worktree-groups",
+  "version": "0.1.1",
+  "description": "DeepSeek Harness 插件：抢占侧栏 sidebar.workspaces，把会话按 git worktree 三级分组（项目 → worktree → 会话）。",
+  "homepage": "https://github.com/lvrayman/dsh-worktree-groups#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lvrayman/dsh-worktree-groups.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lvrayman/dsh-worktree-groups/issues"
+  },
+  "author": "rayman.lv <lvrayman@gmail.com>",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "LICENSE",
+    "README.md",
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "lib/**/*.d.ts.map",
+    "lib/**/*.js.map"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs && node scripts/clean-jsx.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test",
+    "build:client": "node scripts/build-client.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "git",
+    "worktree",
+    "workspace",
+    "sidebar"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [],
+      "immediately": true,
+      "external": [
+        "react",
+        "react/jsx-runtime",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^26.4.0",
+    "esbuild": "^0.28.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.0"
+  }
+}

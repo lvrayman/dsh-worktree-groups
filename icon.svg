@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+  <defs>
+    <mask id="wtg-nodes-cutout">
+      <rect width="36" height="36" fill="#fff"/>
+      <circle cx="11" cy="10" r="1.8" fill="#000"/>
+      <circle cx="11" cy="26" r="1.8" fill="#000"/>
+      <circle cx="25" cy="15" r="1.8" fill="#000"/>
+      <circle cx="25" cy="24" r="1.8" fill="#000"/>
+    </mask>
+  </defs>
+  <g mask="url(#wtg-nodes-cutout)">
+    <path d="M11 10V26" stroke="#3b82f6" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M11 14C11 15 15 15 25 15" stroke="#10b981" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+    <path d="M11 20C11 23 16 24 25 24" stroke="#3b82f6" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+    <circle cx="11" cy="10" r="3.8" fill="#3b82f6"/>
+    <circle cx="11" cy="26" r="3.8" fill="#3b82f6"/>
+    <circle cx="25" cy="15" r="3.6" fill="#10b981"/>
+    <circle cx="25" cy="24" r="3.6" fill="#3b82f6"/>
+  </g>
+</svg>
