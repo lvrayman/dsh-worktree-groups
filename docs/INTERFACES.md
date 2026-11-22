@@ -299,6 +299,13 @@ export async function unarchiveWorkspaceProject(
 - 台账 `lastSeenAt` 按 `LEDGER_LAST_SEEN_REFRESH_MS = 3_600_000` 节流；`clearScanCache()` 清空全部进程内缓存。
 - `src/activity.ts` 新增 `sessionActivityVersion(): number`（每观测一次 `session/event` +1，只增不减）。
 
+**远程控制模式契约（2026-11-22，`ds-harness-remote` 协同，见 [工作记录](worklog/2026-11-22-remote-worktree-display.md)）**
+- 当本机安装并启用了 `ds-harness-remote` 且 `ctx.get('dshRemoteClient')?.status?.()?.mode === 'remote'` 时，本机正远程控制目标机器 B：
+  1. **Tier 1（远端插件直连转发 + 负缓存）**：若机器 B 也加载了支持远程路由桥的 `dsh-worktree-groups`（机器 B 在 `ctx.dshRemote.connections` 的对等连接路由器上拦截 `plugin.route.call` 中 `route === 'dsh-worktree-groups'` 的请求），机器 A 的 5 个 `/dsh-worktree-groups/*` 路由（`tree` / `worktree-create` / `worktree-remove` / `reveal` / `workspace-open`）优先通过 `dshRemoteClient.pluginRoute('dsh-worktree-groups', { endpoint, payload })`（或 `activeRemote().client.rpc('plugin.route.call', ...)`）直接转发到机器 B 的 `dsh-worktree-groups` 执行。当机器 B 返回不支持错误（如 `INVALID_MESSAGE`）时，在 `targetKey` 下记录 60 s 负缓存避免重复必败 RPC。
+  2. **Tier 2（远端网关回退推导 + 并发/超时/缓存/命名启发式归并）**：若机器 B 的 `dsh-worktree-groups` 尚未升级到支持 Tier 1 的版本或处于 Codex/ACP 虚拟工作区模式，机器 A 通过已切换到远端的 `ctx.typertGateway` 读取机器 B 的 `workspace/follow` 基线、`session/list` 会话列表，并结合 `directoryPicker/list` 与 `workspaceFiles/read` 探测机器 B 的 `.git` 主树与 `.git/worktrees/*` 关联 worktree（仅探测已注册工作区与反推主仓，不遍历无关历史会话 `cwd`；支持 `<RepoName>-<branch>` 兄弟/worktrees 目录命名启发式归并；带单次 RPC 超时、并发池与按 `(targetKey, workspaceSignature)` 的进程内扫描缓存），按同一 `buildProjects` / `collectUngrouped` 规则合成机器 B 的 `TreePayload`；`workspace-open` 调用远端 `workspace/create`。
+  3. **状态隔离**：远程模式下不读写机器 A 本地的 `~/.dsh/worktree-groups.json` 台账，不在机器 A 本地执行 D18 `sweepDeadWorkspaces`；`/tree` 的 ETag 与缓存按目标身份（`local` vs `remote:<deviceId>:<backend>`）隔离，切换模式不会误返回 `304 Not Modified`。
+- 客户端 `src/sidebar.tsx` 将 `sources.workspaces(identity)` 派生的工作区快照签名纳入 220 ms 防抖重取 `useEffect` 依赖，使远端工作区基线到达或切换时自动触发 `reload()`。
+
 **`worktree-create` 的部分成功语义（D10）**
 - `ok:true` 只表示 **worktree 已建成**。`workspaceId` 仍可能缺省 —— 此时注册工作区失败，
   不会有自动新会话，故用 `workspaceWarning`（可选，字符串）把失败原因带给调用方。

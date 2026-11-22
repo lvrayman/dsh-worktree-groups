@@ -94,3 +94,19 @@ test('ROW-MEMO: 行内事件经稳定 handlers 容器取最新实现，props 里
   assert.equal(/onOpen:|onMenu:/.test(call), false, '处理器不进 props（否则每次渲染都破坏 memo）')
   assert.match(source, /sessionHandlersRef\.current = sessionHandlers/, '父组件每次渲染刷新处理器表')
 })
+
+test('REMOTE-AC4: sources.workspaces(identity) 派生 workspacesSignature 驱动防抖重取，且 client.tsx 在 dshRemoteTargetActive 下跳过本机 desktopPicker', () => {
+  assert.match(source, /const workspacesSnapshot = sources\.workspaces\(identity\)/)
+  assert.match(source, /const workspacesSignature =/)
+  const effect = source.slice(source.indexOf('setTimeout(reload, RELOAD_DEBOUNCE_MS)'))
+  const deps = effect.slice(effect.indexOf('}, ['), effect.indexOf(']', effect.indexOf('}, [')) + 1)
+  assert.ok(deps.includes('workspacesSignature'), `防抖重取依赖应含 workspacesSignature（远端工作区基线到达或切换时触发 reload）：${deps}`)
+
+  const clientSource = readFileSync(new URL('../src/client.tsx', import.meta.url), 'utf8')
+  assert.match(
+    clientSource,
+    /dshRemoteTargetActive/,
+    'client.tsx 的 pickDirectory 在远端控制激活时应跳过本机 __DSH_DIRECTORY_PICKER__',
+  )
+})
+

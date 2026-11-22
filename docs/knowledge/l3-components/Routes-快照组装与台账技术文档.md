@@ -16,6 +16,8 @@ level: L3
 > 路由 effect 数量仍为 5）；`buildSessionRows` 在全部行（含子代理）到齐后调用
 > `attachLastActivityTimes(rows)` 写 `SessionRow.lastActivityAt`。新增模块见
 > [Activity技术文档](./Activity技术文档.md)、契约 §1.7。
+>
+> ⚠️ **2026-11-22 定点修订（dsh remote 远程控制模式）**：当 `dshRemoteClient.status().mode === 'remote'` 且 `options.forceLocal !== true` 时，`buildTreePayload` 优先走 Tier 1 `plugin.route.call`（`route: 'dsh-worktree-groups'`）向远端主机请求树载荷；Tier 1 不可用时，`collectSnapshot` 走 Tier 2 `collectRemoteGatewaySnapshot`（经远端 `typertGateway` 的 `workspace/follow`、`session/list`、`directoryPicker/list`、`workspaceFiles/read` 还原机器 B 的 git worktree 树），并使用按 `targetKey` 隔离的内存台账（`remoteLedgerStore`）且跳过本机 D18 `sweepDeadWorkspaces`。详见 [工作记录 2026-11-22](../../worklog/2026-11-22-remote-worktree-display.md)。
 
 本文是 `src/routes.ts` 的功能拆分文档之一，覆盖 **宿主事实收集（快照组装）、会话行投影、
 D18 自动清扫、扫描缓存与台账回写**。5 个 HTTP 路由的契约见

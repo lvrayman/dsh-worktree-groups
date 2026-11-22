@@ -2489,3 +2489,492 @@ test('§10 WSR2：重新添加相同目录作为工作空间 ⇒ 自动从已归
   assert.deepEqual(finalPayload.archivedProjects, [])
 })
 
+/* ------------------------------------------------------------------ *
+ * §11 远程控制模式（2026-11-22，dsh remote 控制远端机器 B）
+ * ------------------------------------------------------------------ */
+
+test('§11 AC1（Tier 1 远端插件直连）：remote 控制机器 B 且机器 B 已加载本插件 ⇒ /tree 与工作区/worktree 操作全部转发至机器 B，切回 local 立即恢复且 ETag 不串台', async () => {
+  const fixtureA = await makeGitFixture('wtg-remote-tier1-a')
+  const fixtureB = await makeGitFixture('wtg-remote-tier1-b', [
+    { name: 'wtB', dir: 'demo-repo-wt-b', branch: 'feat-b' },
+  ])
+
+  // 机器 B：有自己的 workspaceRegistry、sessionPersistence 与 dshRemote (HostPluginRuntime)
+  const registryB = fakeRegistry([
+    { id: 'ws-b-main', path: fixtureB.repo, title: 'RepoB', createdAt: '', updatedAt: '' },
+  ])
+  const persistenceB = {
+    list: async () => [
+      { header: { id: 'sess-b-main', createdAt: 1000, cwd: fixtureB.repo } },
+      { header: { id: 'sess-b-wt', createdAt: 2000, cwd: fixtureB.worktreePath.wtB } },
+    ],
+  }
+  const baseRouterB = {
+    pluginRoute: {
+      call: async () => {
+        const err = new Error('The plugin route call is invalid for the remote channel.')
+        err.code = 'INVALID_MESSAGE'
+        throw err
+      },
+    },
+    handle: async (msg) => ({
+      id: msg.id,
+      type: 'rpc.response',
+      payload: { requestId: msg.id, result: await baseRouterB.pluginRoute.call(msg.payload?.params) },
+    }),
+  }
+  const dshRemoteB = {
+    ledger: ledgerAt(fixtureB.root),
+    connections: {
+      active: new Map([['conn-1', { channel: {}, router: baseRouterB, unsubscribe: () => undefined }]]),
+      createRouter: () => baseRouterB,
+    },
+  }
+  const webServerB = {
+    register: () => () => undefined,
+  }
+  const ctxB = makeCtx(
+    services({
+      webServer: webServerB,
+      workspaceRegistry: registryB,
+      sessionPersistence: persistenceB,
+      dshRemote: dshRemoteB,
+    }),
+  )
+  registerRoutes(ctxB)
+
+  // 机器 A：有本地工作区 repoA，同时通过 dshRemoteClient 控制机器 B
+  const registryA = fakeRegistry([
+    { id: 'ws-a-main', path: fixtureA.repo, title: 'RepoA', createdAt: '', updatedAt: '' },
+  ])
+  const persistenceA = {
+    list: async () => [{ header: { id: 'sess-a-main', createdAt: 500, cwd: fixtureA.repo } }],
+  }
+  let mode = 'remote'
+  const remoteClientA = {
+    status: () =>
+      mode === 'remote'
+        ? { mode: 'remote', connected: true, backend: 'harness', target: { deviceId: 'device-b', name: 'Machine B' } }
+        : { mode: 'local', connected: false, backend: 'harness' },
+    activeRemote: () =>
+      mode === 'remote'
+        ? {
+            target: { deviceId: 'device-b', name: 'Machine B' },
+            features: { pluginRoute: true },
+            client: {
+              rpc: async (method, params) => {
+                assert.equal(method, 'plugin.route.call')
+                return await baseRouterB.pluginRoute.call(params)
+              },
+            },
+          }
+        : undefined,
+    pluginRoute: async (route, body) => await baseRouterB.pluginRoute.call({ route, body }),
+  }
+
+  const serverA = await startRouteServer({
+    workspaceRegistry: registryA,
+    sessionPersistence: persistenceA,
+    dshRemoteClient: remoteClientA,
+  })
+
+  clearScanCache()
+  try {
+    // 1) remote 模式下 /tree 返回机器 B 的项目与两个 worktree（主树 + wtB），绝不返回机器 A 的 repoA
+    const remoteHttpRes = await fetch(`http://127.0.0.1:${serverA.port}${ROUTE_PATHS.tree}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(remoteHttpRes.status, 200)
+    const remoteEtag = remoteHttpRes.headers.get('etag')
+    assert.ok(typeof remoteEtag === 'string' && remoteEtag.length > 0)
+    const remoteTree = await remoteHttpRes.json()
+    assert.equal(remoteTree.ok, true)
+    assert.equal(remoteTree.projects.length, 1, '应只展示机器 B 的 1 个 git 项目')
+    const projB = remoteTree.projects[0]
+    assert.equal(projB.isGit, true)
+    assert.equal(projB.mainPath, fixtureB.repo)
+    assert.deepEqual(
+      projB.worktrees.map((w) => ({ path: w.path, branch: w.branch, isMain: w.isMain })),
+      [
+        { path: fixtureB.repo, branch: 'main', isMain: true },
+        { path: fixtureB.worktreePath.wtB, branch: 'feat-b', isMain: false },
+      ],
+      '★ 必须以 worktree 树展示机器 B 的主仓与关联 worktree',
+    )
+    assert.deepEqual(
+      projB.worktrees[0].sessions.map((s) => s.sessionId),
+      ['sess-b-main'],
+    )
+    assert.deepEqual(
+      projB.worktrees[1].sessions.map((s) => s.sessionId),
+      ['sess-b-wt'],
+    )
+
+    // 2) remote 模式下 workspace-open 在机器 B 上注册工作区，不碰机器 A 的 registryA
+    const openRes = await serverA.post(ROUTE_PATHS.workspaceOpen, { path: fixtureB.worktreePath.wtB })
+    assert.equal(openRes.status, 200)
+    assert.equal(openRes.body.ok, true)
+    assert.equal(registryA.created.length, 0, '不得在机器 A 本地创建工作区')
+    assert.deepEqual(registryB.created, [fixtureB.worktreePath.wtB], '必须在机器 B 上创建工作区')
+
+    // 3) 切回 local 模式：即使携带刚才的 remoteEtag，也绝不能误回 304，必须返回机器 A 的本地树
+    mode = 'local'
+    const localHttpRes = await fetch(`http://127.0.0.1:${serverA.port}${ROUTE_PATHS.tree}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'if-none-match': remoteEtag },
+      body: '{}',
+    })
+    assert.equal(localHttpRes.status, 200, '★ 从 remote 切回 local 时不得误命中 304')
+    const localBody = await localHttpRes.json()
+    assert.equal(localBody.ok, true)
+    const projA = localBody.projects.find((p) => p.mainPath === fixtureA.repo)
+    assert.ok(projA !== undefined, '切回 local 后应展示机器 A 的项目')
+    assert.equal(
+      localBody.projects.some((p) => p.mainPath === fixtureB.repo),
+      false,
+      '切回 local 后不得残留机器 B 的项目',
+    )
+  } finally {
+    await serverA.close()
+  }
+})
+
+test('§11 AC2/AC3（Tier 2 远端网关回退 + 状态隔离）：机器 B 未升级 Tier 1 钩子时，经远端 typertGateway 还原机器 B 的 git worktree 树，且不污染机器 A 台账、不触发机器 A 的 D18 清扫', async () => {
+  const fixtureA = await makeGitFixture('wtg-remote-tier2-a')
+  const fixtureB = await makeGitFixture('wtg-remote-tier2-b', [
+    { name: 'wtB', dir: 'demo-repo-wt-b2', branch: 'feat-b2' },
+  ])
+  const { readdir: fsReaddir, readFile: fsReadFile, stat: fsStat } = await import('node:fs/promises')
+
+  // 机器 A 本地有一个指向已消失路径的死工作区：验证 remote 模式下不会误删机器 A 的本地工作区
+  const deletedLocalA = []
+  const deadPathA = join(fixtureA.root, 'dead-local-worktree')
+  const registryA = fakeRegistry(
+    [
+      { id: 'ws-a-live', path: fixtureA.repo, title: 'RepoA', createdAt: '', updatedAt: '' },
+      { id: 'ws-a-dead', path: deadPathA, title: 'DeadA', createdAt: '', updatedAt: '' },
+    ],
+    (id) => deletedLocalA.push(id),
+  )
+  const persistenceA = {
+    list: async () => [{ header: { id: 'sess-a-1', createdAt: 100, cwd: fixtureA.repo } }],
+  }
+
+  // 机器 B 的远端网关模拟（仅暴露 ds-harness-remote 标准允许的 workspace/follow、session/list、directoryPicker/list、workspaceFiles/read、workspace/create）
+  const remoteWorkspacesB = [
+    {
+      workspaceId: 'ws-b-main',
+      path: fixtureB.repo,
+      title: 'RemoteRepoB',
+      createdAt: '2026-11-22T00:00:00Z',
+      updatedAt: '2026-11-22T00:00:00Z',
+    },
+  ]
+  const remoteSessionsB = [
+    {
+      sessionId: 'sess-b-main',
+      cwd: fixtureB.repo,
+      updatedAt: 5000,
+      running: false,
+      blank: false,
+      title: 'Main session on B',
+    },
+    {
+      sessionId: 'sess-b-wt',
+      cwd: fixtureB.worktreePath.wtB,
+      updatedAt: 6000,
+      running: true,
+      blank: false,
+      title: 'Worktree session on B',
+    },
+  ]
+  const remoteCreatedB = []
+
+  const handleGatewayCall = async (endpoint, args) => {
+    if (endpoint === 'session/list') {
+      return { items: remoteSessionsB }
+    }
+    if (endpoint === 'directoryPicker/list') {
+      const target = args?.path
+      const rows = await fsReaddir(target, { withFileTypes: true })
+      const entries = []
+      for (const row of rows) {
+        const child = join(target, row.name)
+        const isDir = row.isDirectory() || (row.isSymbolicLink() && (await fsStat(child).then((s) => s.isDirectory()).catch(() => false)))
+        if (isDir) entries.push({ name: row.name, path: child, hidden: row.name.startsWith('.') })
+      }
+      return { path: target, home: fixtureB.root, crumbs: [], entries, truncated: false }
+    }
+    if (endpoint === 'workspaceFiles/read' || endpoint === 'workspaceFiles/readAll') {
+      const scopeId = args?.workspaceFileScopeId
+      const sess = remoteSessionsB.find((s) => s.sessionId === scopeId)
+      if (!sess) throw new Error('session not found')
+      const filePath = join(sess.cwd, args.path)
+      const info = await fsStat(filePath)
+      if (!info.isFile()) throw new Error('not a regular file')
+      const text = await fsReadFile(filePath, 'utf8')
+      return { absolutePath: filePath, version: '1', offset: 1, text, lines: text.split('\n').length, eof: true }
+    }
+    if (endpoint === 'workspace/create') {
+      const p = args?.request?.path ?? args?.path
+      remoteCreatedB.push(p)
+      const created = {
+        workspaceId: `ws-b-new-${remoteCreatedB.length}`,
+        path: p,
+        title: 'NewRemoteWS',
+        createdAt: '',
+        updatedAt: '',
+      }
+      remoteWorkspacesB.push(created)
+      return { workspace: created }
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`)
+  }
+
+  const typertGatewayA = {
+    invoke: async (req) => await handleGatewayCall(`${req.namespace}/${req.method}`, req.args),
+    stream: async (req) => {
+      assert.equal(`${req.namespace}/${req.method}`, 'workspace/follow')
+      return (async function* () {
+        yield {
+          type: 'baseline',
+          value: {
+            items: remoteWorkspacesB,
+            archivedSessionIds: [],
+            pinnedSessionIds: [],
+          },
+        }
+      })()
+    },
+  }
+
+  const remoteClientA = {
+    status: () => ({
+      mode: 'remote',
+      connected: true,
+      backend: 'harness',
+      target: { deviceId: 'device-b-unupgraded', name: 'Machine B (Old Plugin)' },
+    }),
+    activeRemote: () => ({
+      target: { deviceId: 'device-b-unupgraded', name: 'Machine B (Old Plugin)' },
+      features: { pluginRoute: true },
+      client: {
+        rpc: async (method) => {
+          if (method === 'plugin.route.call') {
+            const err = new Error('The plugin route call is invalid for the remote channel.')
+            err.code = 'INVALID_MESSAGE'
+            throw err
+          }
+          throw new Error(`unexpected rpc: ${method}`)
+        },
+      },
+    }),
+    pluginRoute: async () => {
+      const err = new Error('The plugin route call is invalid for the remote channel.')
+      err.code = 'INVALID_MESSAGE'
+      throw err
+    },
+  }
+
+  const ledgerA = ledgerAt(fixtureA.root)
+  const ctxA = makeCtx(
+    services({
+      workspaceRegistry: registryA,
+      sessionPersistence: persistenceA,
+      typertGateway: typertGatewayA,
+      dshRemoteClient: remoteClientA,
+    }),
+  )
+
+  clearScanCache()
+  const payload = await buildTreePayload(ctxA, { ledger: ledgerA, now: 10_000 })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.projects.length, 1, 'Tier 2 回退应展示机器 B 的 1 个 git 项目')
+  const projB = payload.projects[0]
+  assert.equal(projB.isGit, true, '应识别出机器 B 的工作区为 git 仓')
+  assert.equal(projB.mainPath, fixtureB.repo)
+  assert.deepEqual(
+    projB.worktrees.map((w) => ({ path: w.path, branch: w.branch, isMain: w.isMain, exists: w.exists })),
+    [
+      { path: fixtureB.repo, branch: 'main', isMain: true, exists: true },
+      { path: fixtureB.worktreePath.wtB, branch: 'feat-b2', isMain: false, exists: true },
+    ],
+    '★ Tier 2 回退也必须通过远端 .git/worktrees 元数据还原出机器 B 的全部 worktree 及分支名',
+  )
+  assert.deepEqual(
+    projB.worktrees[0].sessions.map((s) => s.sessionId),
+    ['sess-b-main'],
+  )
+  assert.deepEqual(
+    projB.worktrees[1].sessions.map((s) => s.sessionId),
+    ['sess-b-wt'],
+  )
+
+  // 状态隔离校验：机器 A 的本地死工作区未被 D18 误删，机器 A 的本地台账未被机器 B 污染
+  assert.deepEqual(deletedLocalA, [], '★ remote 模式下不得清扫删除机器 A 的本地工作区')
+  const ledgerDataA = await ledgerA.read()
+  assert.deepEqual(Object.keys(ledgerDataA.projects), [], '★ remote 模式下不得向机器 A 本地台账写入机器 B 的项目')
+  assert.deepEqual(Object.keys(ledgerDataA.sessions), [], '★ remote 模式下不得向机器 A 本地台账写入机器 B 的会话')
+
+  // Tier 2 下 workspace-open 走远端 workspace/create
+  const serverA = await startRouteServer({
+    workspaceRegistry: registryA,
+    sessionPersistence: persistenceA,
+    typertGateway: typertGatewayA,
+    dshRemoteClient: remoteClientA,
+  })
+  try {
+    const res = await serverA.post(ROUTE_PATHS.workspaceOpen, { path: fixtureB.worktreePath.wtB })
+    assert.equal(res.status, 200)
+    assert.equal(res.body.ok, true)
+    assert.equal(res.body.workspaceId, 'ws-b-new-1')
+    assert.deepEqual(remoteCreatedB, [fixtureB.worktreePath.wtB])
+    assert.deepEqual(registryA.created, [])
+  } finally {
+    await serverA.close()
+  }
+})
+
+test('§11 AC2-perf：Tier 2 远程回退在大量历史会话与无会话 worktree 下不遍历无关会话 cwd、支持命名启发式归并、带扫描缓存与 Tier 1 负缓存', async (t) => {
+  const remoteMainRepo = '/Users/machineB/Documents/Project/AppRepo'
+  const remoteLinkedSib = '/Users/machineB/Documents/Project/AppRepo-feat-login'
+  const remoteLinkedNested = '/Users/machineB/Documents/Project/worktrees/AppRepo-fix-header'
+  const remotePlainWs = '/Users/machineB/Documents/Notes'
+
+  const remoteWorkspacesB = [
+    { workspaceId: 'ws-b-1', path: remoteMainRepo, title: 'AppRepo', createdAt: '', updatedAt: '' },
+    { workspaceId: 'ws-b-2', path: remoteLinkedSib, title: 'AppRepo-feat-login', createdAt: '', updatedAt: '' },
+    { workspaceId: 'ws-b-3', path: remoteLinkedNested, title: 'AppRepo-fix-header', createdAt: '', updatedAt: '' },
+    { workspaceId: 'ws-b-4', path: remotePlainWs, title: 'Notes', createdAt: '', updatedAt: '' },
+  ]
+
+  // 构造 200 个散落在不相关历史目录的会话（且主仓与关联 worktree 没有任何会话可用于 workspaceFiles/read）
+  const remoteSessionsB = Array.from({ length: 200 }, (_, i) => ({
+    id: `sess-unrelated-${i}`,
+    title: `Old Session ${i}`,
+    cwd: `/Users/machineB/Old Scratch/dir-${i}`,
+    createdAt: '2026-10-01T00:00:00.000Z',
+    updatedAt: '2026-10-01T00:01:00.000Z',
+    running: false,
+  }))
+
+  const dirPickerCalls = []
+  let tier1PluginRouteCalls = 0
+
+  const typertGatewayA = {
+    invoke: async (req) => {
+      const endpoint = `${req.namespace}/${req.method}`
+      if (endpoint === 'session/list') {
+        return { items: remoteSessionsB }
+      }
+      if (endpoint === 'directoryPicker/list') {
+        const dirPath = req.args?.path
+        dirPickerCalls.push(dirPath)
+        if (dirPath === remoteMainRepo) {
+          return {
+            path: dirPath,
+            entries: [
+              { name: '.git', path: `${remoteMainRepo}/.git` },
+              { name: 'src', path: `${remoteMainRepo}/src` },
+            ],
+          }
+        }
+        if (dirPath === `${remoteMainRepo}/.git/worktrees`) {
+          return {
+            path: dirPath,
+            entries: [
+              { name: 'AppRepo-feat-login', path: `${remoteMainRepo}/.git/worktrees/AppRepo-feat-login` },
+              { name: 'AppRepo-fix-header', path: `${remoteMainRepo}/.git/worktrees/AppRepo-fix-header` },
+            ],
+          }
+        }
+        if (dirPath === remoteLinkedSib || dirPath === remoteLinkedNested || dirPath === remotePlainWs) {
+          return {
+            path: dirPath,
+            entries: [{ name: 'README.md', path: `${dirPath}/README.md` }],
+          }
+        }
+        throw new Error(`directory not found: ${dirPath}`)
+      }
+      if (endpoint === 'workspaceFiles/read') {
+        throw new Error('no session available in repo for workspaceFiles/read')
+      }
+      throw new Error(`unexpected endpoint: ${endpoint}`)
+    },
+    stream: async () =>
+      (async function* () {
+        yield {
+          type: 'baseline',
+          value: {
+            items: remoteWorkspacesB,
+            archivedSessionIds: [],
+          },
+        }
+      })(),
+  }
+
+  const remoteClientA = {
+    status: () => ({
+      mode: 'remote',
+      connected: true,
+      backend: 'harness',
+      target: { deviceId: 'device-b-many-sessions', name: 'Machine B' },
+    }),
+    pluginRoute: async () => {
+      tier1PluginRouteCalls += 1
+      const err = new Error('The plugin route call is invalid for the remote channel.')
+      err.code = 'INVALID_MESSAGE'
+      throw err
+    },
+  }
+
+  const ctxA = makeCtx(
+    services({
+      workspaceRegistry: fakeRegistry([]),
+      sessionPersistence: { list: async () => [] },
+      typertGateway: typertGatewayA,
+      dshRemoteClient: remoteClientA,
+    }),
+  )
+
+  clearScanCache()
+  const payload1 = await buildTreePayload(ctxA, { now: 20_000 })
+  assert.equal(payload1.ok, true)
+
+  // 1) 绝不遍历 200 个无关历史会话的 cwd
+  const unrelatedProbes = dirPickerCalls.filter((p) => String(p).includes('Old Scratch'))
+  assert.deepEqual(unrelatedProbes, [], '★ Tier 2 不得对无关历史会话的 cwd 逐个调用 directoryPicker/list')
+  assert.equal(
+    dirPickerCalls.length <= 12,
+    true,
+    `★ Tier 2 首次探测目录 RPC 次数必须受控（实际 ${dirPickerCalls.length} 次）`,
+  )
+
+  // 2) 即使没有任何会话可供 workspaceFiles/read，也能通过 .git/worktrees/<name> + 命名启发式把关联 worktree 归并到主树下
+  assert.equal(payload1.projects.length, 2, '应合并为 1 个 git 项目（含 3 个 worktree）+ 1 个普通工作区 Notes')
+  const gitProj = payload1.projects.find((p) => p.mainPath === remoteMainRepo)
+  assert.ok(gitProj, '应识别出 AppRepo 主工作树项目')
+  assert.equal(gitProj.isGit, true)
+  assert.deepEqual(
+    gitProj.worktrees.map((w) => ({ path: w.path, branch: w.branch, isMain: w.isMain })),
+    [
+      { path: remoteMainRepo, branch: undefined, isMain: true },
+      { path: remoteLinkedSib, branch: 'feat-login', isMain: false },
+      { path: remoteLinkedNested, branch: 'fix-header', isMain: false },
+    ],
+    '★ 无会话可读 gitdir/HEAD 时，应通过 .git/worktrees 目录名与 <MainRepo>-<branch> 命名启发式归并关联 worktree 并提取分支名',
+  )
+
+  // 3) 第二次轮询应命中 Tier 1 负缓存与 Tier 2 仓库扫描缓存（0 次新的 directoryPicker/list 与 pluginRoute 调用）
+  const callsAfterFirst = dirPickerCalls.length
+  assert.equal(tier1PluginRouteCalls, 1)
+  const payload2 = await buildTreePayload(ctxA, { now: 25_000 })
+  assert.equal(payload2.ok, true)
+  assert.equal(tier1PluginRouteCalls, 1, '★ Tier 1 负缓存期内不应重复发起必败的 plugin.route.call')
+  assert.equal(dirPickerCalls.length, callsAfterFirst, '★ Tier 2 扫描缓存命中时不应重复调用远端 directoryPicker/list')
+})
+
+
+

@@ -132,6 +132,7 @@
 | 2026-10-29 | [「最近」分区按会话最后更新时间（任意活动）倒序](worklog/2026-10-29-recent-any-activity-sort.md) |
 | 2026-11-14 | [整体性能优化 + 会话列表渐进式展开](worklog/2026-11-14-perf-progressive-expand.md) |
 | 2026-11-22 | [开源发布准备（信息脱敏、DSH 插件规范补齐、README 重构与 GitHub 发布）](worklog/2026-11-22-open-source-release.md) |
+| 2026-11-22 | [dsh remote 控制远端机器 B 时侧栏切换显示机器 B 的 Worktree 工作区树](worklog/2026-11-22-remote-worktree-display.md) |
 
 ## 新增文档归档约定
 

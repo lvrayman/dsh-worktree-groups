@@ -174,8 +174,11 @@ function createBridge(ctx: Context): SidebarBridge {
       //    路径输入弹窗兜底。**绝不能** `catch { return null }` —— 那会把「选择器不可用」
       //    伪装成「用户取消」，正是「点击 `+` 毫无反应」的根因。
       // 与官方 `dsh-client-ui-directory-picker-native/lib/client.js:63-64` 同构。
+      const isRemoteTargetActive =
+        typeof document !== 'undefined' &&
+        document.documentElement?.classList?.contains('dshRemoteTargetActive') === true
       const desktopPicker = (globalThis as any).__DSH_DIRECTORY_PICKER__
-      if (typeof desktopPicker?.pick === 'function') {
+      if (!isRemoteTargetActive && typeof desktopPicker?.pick === 'function') {
         const picked = await desktopPicker.pick()
         return typeof picked === 'string' ? picked : null
       }

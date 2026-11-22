@@ -36,7 +36,7 @@ import { createFileLedger } from './ledger.js'
 import { buildProjects, collectUngrouped } from './projects.js'
 
 import type { LedgerArchivedProject, LedgerData, LedgerStore } from './ledger.js'
-import type { ArchivedProjectRow, ProjectNode, RepoInfo, SessionRow, WorkspaceRow } from './types.js'
+import type { ArchivedProjectRow, ProjectNode, RepoInfo, SessionRow, WorkspaceRow, WorktreeEntry } from './types.js'
 
 /** 全部路由的统一前缀（路由表是全局的，必须带自己的命名空间，宿主契约硬约束 17）。 */
 const ROUTE_PREFIX = '/dsh-worktree-groups'
@@ -160,6 +160,80 @@ interface HostWebServer {
   }) => () => void
 }
 
+/** `ds-harness-remote` 远端插件路由桥通道名（Tier 1）。 */
+const REMOTE_PLUGIN_ROUTE = 'dsh-worktree-groups'
+
+interface RemotePluginRouteBridgeLike {
+  call?: (input: unknown, transferred?: boolean) => Promise<{ status: number; json: unknown }>
+}
+
+interface RemoteHostRouterLike {
+  pluginRoute?: RemotePluginRouteBridgeLike
+  handle?: (message: unknown) => Promise<unknown>
+}
+
+interface RemoteHostConnectionsLike {
+  active?: Map<string, { channel?: unknown; router?: RemoteHostRouterLike; unsubscribe?: () => void }>
+  createRouter?: (context: unknown, send: unknown) => RemoteHostRouterLike
+}
+
+/** 机器 B 上的 `ctx.dshRemote`（`HostPluginRuntime`）。 */
+interface HostDshRemote {
+  connections?: RemoteHostConnectionsLike
+  /** 可选：同进程模拟双端时为机器 B 指定独立台账（避免与机器 A 共享默认磁盘台账）。 */
+  ledger?: LedgerStore
+}
+
+interface RemoteClientStatusLike {
+  mode?: unknown
+  connected?: unknown
+  backend?: unknown
+  target?: { deviceId?: unknown; name?: unknown }
+  connectedTargetDeviceId?: unknown
+}
+
+interface RemoteActiveConnectionLike {
+  target?: { deviceId?: unknown; name?: unknown }
+  features?: { pluginRoute?: unknown }
+  client?: {
+    rpc?: (method: string, params: unknown, signal?: AbortSignal) => Promise<unknown>
+  }
+}
+
+/** 机器 A 上的 `ctx.dshRemoteClient`（`ClientModeRuntime`）。 */
+interface HostDshRemoteClient {
+  status?: () => RemoteClientStatusLike | undefined
+  activeRemote?: () => RemoteActiveConnectionLike | undefined
+  connected?: RemoteActiveConnectionLike
+  pluginRoute?: (
+    route: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => Promise<{ status?: unknown; json?: unknown }>
+}
+
+/** `ctx.typertGateway`（`ds-harness-remote` 在 remote 模式下将其切换至远端机器 B）。 */
+interface HostTypertGateway {
+  invoke?: (request: {
+    namespace: string
+    method: string
+    args: Record<string, unknown>
+    signal?: AbortSignal
+  }) => Promise<unknown>
+  stream?: (request: {
+    namespace: string
+    method: string
+    args: Record<string, unknown>
+    signal?: AbortSignal
+  }) => Promise<AsyncIterable<unknown>>
+  dispatchRpc?: (
+    endpoint: string,
+    payload: { args: Record<string, unknown> },
+    signal?: AbortSignal,
+  ) => Promise<{ ok?: unknown; value?: unknown; error?: { code?: unknown; message?: unknown } }>
+  openWireStream?: (...args: unknown[]) => Promise<AsyncIterable<unknown>>
+}
+
 /**
  * 从 ctx 惰性取宿主服务。
  *
@@ -176,6 +250,32 @@ function getService<T>(ctx: Context, name: string): T | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * 读取可选协同服务（如 `dshRemoteClient` / `dshRemote` / `typertGateway`）。
+ *
+ * 在真实 Cordis 下，提供方 fiber 若尚处于异步启动阶段（`fiber.state === 1`），
+ * `ctx.get(name)`（默认 `strict = true`）会返回 `undefined`，此时用 `ctx.get(name, false)` 兜底；
+ * 测试替身的 `get(name)` 通常只有 1 个形参，仅在 `get.length >= 2` 时才补调 `strict = false`。
+ */
+function getOptionalService<T>(ctx: Context, name: string): T | undefined {
+  const direct = getService<T>(ctx, name)
+  if (direct !== undefined) return direct
+  try {
+    const getter = (ctx as unknown as { get?: (key: string, strict?: boolean) => unknown }).get
+    if (typeof getter === 'function' && getter.length >= 2) {
+      const nonStrict = getter.call(ctx, name, false) as T | undefined
+      if (nonStrict !== undefined && nonStrict !== null) return nonStrict
+    }
+    const root = (ctx as unknown as { root?: Context }).root
+    if (root !== undefined && root !== ctx) {
+      return getService<T>(root, name)
+    }
+  } catch {
+    // 忽略
+  }
+  return undefined
 }
 
 /* ------------------------------------------------------------------ *
@@ -218,9 +318,39 @@ export const SCAN_CACHE_MAX_AGE_MS = 5 * 60_000
 /** 并行扫描的并发上限（每个扫描最多 3 个 git 子进程）。 */
 const SCAN_CONCURRENCY = 6
 
-/** 清空全部进程内缓存（git 扫描 + 会话列举 + `/tree` 载荷）。测试用；也用于故障后强制重扫。 */
+/** 按远端目标身份（`remote:<deviceId>:<backend>`）隔离的内存台账（避免污染本机台账）。 */
+const remoteLedgers = new Map<string, LedgerStore>()
+
+/** Tier 1 远端插件路由不支持时的负缓存（`targetKey` → 探测时间戳），避免每次轮询重复发起必败 RPC。 */
+const remoteTier1UnsupportedAt = new Map<string, number>()
+
+/** Tier 1 负缓存有效期（60 s）。 */
+const REMOTE_TIER1_NEG_CACHE_TTL_MS = 60_000
+
+/** Tier 2 远端网关 git 仓扫描缓存条目。 */
+interface RemoteRepoScanCacheEntry {
+  at: number
+  workspaceSig: string
+  repos: Map<string, RepoInfo>
+  pathToCommonDir: Map<string, string>
+  liveWorkspacePaths: Set<string>
+}
+
+/** 按 `targetKey` 隔离的 Tier 2 远端 git 仓扫描缓存。 */
+const remoteRepoScanCache = new Map<string, RemoteRepoScanCacheEntry>()
+
+/** Tier 2 远端 git 仓扫描缓存有效期（30 s；工作区列表签名变化时立即失效）。 */
+const REMOTE_REPO_SCAN_CACHE_TTL_MS = 30_000
+
+/** 远端网关单次 RPC / 首帧超时（防止远端流或目录探测未就绪时永久挂起 `/tree`）。 */
+const REMOTE_RPC_TIMEOUT_MS = 3_500
+
+/** 清空全部进程内缓存（git 扫描 + 会话列举 + `/tree` 载荷 + 远端内存台账与远端探测缓存）。测试用；也用于故障后强制重扫。 */
 export function clearScanCache(): void {
   scanCache.clear()
+  remoteLedgers.clear()
+  remoteTier1UnsupportedAt.clear()
+  remoteRepoScanCache.clear()
   clearSessionRowsCache()
 }
 
@@ -711,6 +841,8 @@ export interface SnapshotOptions {
    * 只有 `/tree` 路由开启；直接调用导出函数时缺省关闭，保持「每次都读宿主」的旧语义。
    */
   reuseSessions?: boolean
+  /** 内部标记：强制按本机模式执行（机器 B 作为远端 Host 响应 Tier 1 转发时防止递归）。 */
+  forceLocal?: boolean
 }
 
 /* ------------------------------------------------------------------ *
@@ -866,12 +998,990 @@ async function ledgerStore(): Promise<LedgerStore> {
   return defaultLedger
 }
 
+/** 取指定远端目标的内存台账（与本机磁盘台账完全隔离）。 */
+function remoteLedgerStore(targetKey: string): LedgerStore {
+  const existing = remoteLedgers.get(targetKey)
+  if (existing !== undefined) return existing
+  let data: LedgerData = { version: 1, projects: {}, sessions: {} }
+  const store: LedgerStore = {
+    async read(): Promise<LedgerData> {
+      return data
+    },
+    async write(next: LedgerData): Promise<void> {
+      data = next
+    },
+    async update(mutator: (current: LedgerData) => LedgerData): Promise<LedgerData> {
+      data = mutator(data)
+      return data
+    },
+  }
+  remoteLedgers.set(targetKey, store)
+  return store
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * 读取 `ds-harness-remote` 客户端控制态（2026-11-22）。
+ *
+ * 当机器 A 通过 `dsh remote` 控制远端机器 B 时，`ctx.get('dshRemoteClient').status().mode === 'remote'`。
+ */
+function readRemoteClientState(ctx: Context): {
+  isRemote: boolean
+  targetKey: string
+  deviceId: string
+  backend: string
+  client?: HostDshRemoteClient
+} {
+  const client = getOptionalService<HostDshRemoteClient>(ctx, 'dshRemoteClient')
+  if (client === undefined || typeof client.status !== 'function') {
+    return { isRemote: false, targetKey: 'local', deviceId: '', backend: 'harness' }
+  }
+  try {
+    const status = client.status()
+    if (status?.mode !== 'remote') {
+      return { isRemote: false, targetKey: 'local', deviceId: '', backend: 'harness', client }
+    }
+    const active = typeof client.activeRemote === 'function' ? client.activeRemote() : client.connected
+    const deviceId =
+      nonEmptyString(status.target?.deviceId) ??
+      nonEmptyString(active?.target?.deviceId) ??
+      nonEmptyString(status.connectedTargetDeviceId) ??
+      'remote'
+    const backend = nonEmptyString(status.backend) ?? 'harness'
+    return {
+      isRemote: true,
+      targetKey: `remote:${deviceId}:${backend}`,
+      deviceId,
+      backend,
+      client,
+    }
+  } catch {
+    return { isRemote: false, targetKey: 'local', deviceId: '', backend: 'harness' }
+  }
+}
+
+/** 判断 Tier 1 调用失败是否属于「远端机器 B 尚未加载支持 Tier 1 的插件路由」。 */
+function isTier1UnsupportedError(error: unknown): boolean {
+  if (!isPlainRecord(error)) return false
+  const code = nonEmptyString(error['code']) ?? nonEmptyString((error['details'] as Record<string, unknown> | undefined)?.['remoteCode'])
+  if (
+    code === 'INVALID_MESSAGE' ||
+    code === 'METHOD_NOT_FOUND' ||
+    code === 'FEATURE_NOT_SUPPORTED' ||
+    code === 'CAPABILITY_NOT_SUPPORTED'
+  ) {
+    return true
+  }
+  const message = nonEmptyString(error['message']) ?? ''
+  return /invalid for the remote channel|cannot forward.*plugin routes|does not exist/i.test(message)
+}
+
+/** 构造带超时保护的 AbortSignal（同时关联外部 `signal`）。 */
+function withRemoteTimeoutSignal(signal: AbortSignal | undefined, timeoutMs = REMOTE_RPC_TIMEOUT_MS): {
+  signal: AbortSignal
+  cleanup: () => void
+} {
+  const controller = new AbortController()
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`remote gateway operation timed out after ${timeoutMs}ms`))
+  }, timeoutMs)
+  if (typeof (timer as { unref?: () => void }).unref === 'function') {
+    ;(timer as { unref: () => void }).unref()
+  }
+  const combined = signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal])
+  return {
+    signal: combined,
+    cleanup: () => {
+      clearTimeout(timer)
+    },
+  }
+}
+
+/**
+ * 尝试通过 Tier 1（`ds-harness-remote` 的 `plugin.route.call`）将请求直接转发到远端机器 B 的 `dsh-worktree-groups`。
+ */
+async function tryCallRemotePluginRoute(
+  ctx: Context,
+  endpoint: 'tree' | 'worktree-create' | 'worktree-remove' | 'reveal' | 'workspace-open',
+  payload: Record<string, unknown>,
+  signal?: AbortSignal,
+  now = Date.now(),
+): Promise<{ supported: false } | { supported: true; status: number; payload: Record<string, unknown> }> {
+  const state = readRemoteClientState(ctx)
+  if (!state.isRemote || state.backend !== 'harness' || state.client === undefined) {
+    return { supported: false }
+  }
+  const unsupportedAt = remoteTier1UnsupportedAt.get(state.targetKey)
+  if (
+    unsupportedAt !== undefined &&
+    now >= unsupportedAt &&
+    now - unsupportedAt < REMOTE_TIER1_NEG_CACHE_TTL_MS
+  ) {
+    return { supported: false }
+  }
+  const body = { endpoint, payload }
+  const timed = withRemoteTimeoutSignal(signal)
+  try {
+    let raw: unknown
+    if (typeof state.client.pluginRoute === 'function') {
+      raw = await state.client.pluginRoute(REMOTE_PLUGIN_ROUTE, body, timed.signal)
+    } else {
+      const active = typeof state.client.activeRemote === 'function' ? state.client.activeRemote() : state.client.connected
+      if (typeof active?.client?.rpc !== 'function') return { supported: false }
+      raw = await active.client.rpc('plugin.route.call', { route: REMOTE_PLUGIN_ROUTE, body }, timed.signal)
+    }
+    if (!isPlainRecord(raw)) return { supported: false }
+    const status = typeof raw['status'] === 'number' ? raw['status'] : 200
+    const jsonPayload = isPlainRecord(raw['json']) ? raw['json'] : undefined
+    if (status === 404 || status === 503 || jsonPayload === undefined) {
+      return { supported: false }
+    }
+    if (jsonPayload['ok'] === false && isTier1UnsupportedError(jsonPayload['error'])) {
+      remoteTier1UnsupportedAt.set(state.targetKey, now)
+      return { supported: false }
+    }
+    remoteTier1UnsupportedAt.delete(state.targetKey)
+    return { supported: true, status, payload: jsonPayload }
+  } catch (error) {
+    if (isTier1UnsupportedError(error)) {
+      remoteTier1UnsupportedAt.set(state.targetKey, now)
+      return { supported: false }
+    }
+    // 若存在远端 typertGateway 可回退（如 tree / workspace-open），交由 Tier 2 兜底
+    if (
+      (endpoint === 'tree' || endpoint === 'workspace-open') &&
+      getOptionalService<HostTypertGateway>(ctx, 'typertGateway') !== undefined
+    ) {
+      return { supported: false }
+    }
+    return {
+      supported: true,
+      status: 400,
+      payload: { ok: false, message: failMessage(error) },
+    }
+  } finally {
+    timed.cleanup()
+  }
+}
+
+/** 调用远端 `ctx.typertGateway` 的 unary 方法（兼容 `invoke` 与 `dispatchRpc`，自带超时保护）。 */
+async function invokeRemoteGateway(
+  gateway: HostTypertGateway,
+  namespace: string,
+  method: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const timed = withRemoteTimeoutSignal(signal)
+  try {
+    if (typeof gateway.invoke === 'function') {
+      return await gateway.invoke({
+        namespace,
+        method,
+        args,
+        signal: timed.signal,
+      })
+    }
+    if (typeof gateway.dispatchRpc === 'function') {
+      const res = await gateway.dispatchRpc(`${namespace}/${method}`, { args }, timed.signal)
+      if (res?.ok === true) return res.value
+      throw new Error(nonEmptyString(res?.error?.message) ?? `remote gateway ${namespace}/${method} failed`)
+    }
+    throw new Error('typertGateway does not support unary invocation')
+  } finally {
+    timed.cleanup()
+  }
+}
+
+/** 打开远端 `ctx.typertGateway` 的流（兼容 `stream` 与 3/5 参 `openWireStream`）。 */
+async function openRemoteGatewayStream(
+  gateway: HostTypertGateway,
+  namespace: string,
+  method: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<AsyncIterable<unknown>> {
+  if (typeof gateway.stream === 'function') {
+    return await gateway.stream({
+      namespace,
+      method,
+      args,
+      ...(signal === undefined ? {} : { signal }),
+    })
+  }
+  if (typeof gateway.openWireStream === 'function') {
+    const endpoint = `${namespace}/${method}`
+    const activeSignal = signal ?? new AbortController().signal
+    if (gateway.openWireStream.length >= 5) {
+      const endedUplink = {
+        [Symbol.asyncIterator]() {
+          return { next: () => Promise.resolve({ done: true as const, value: undefined }) }
+        },
+      }
+      return await gateway.openWireStream(endpoint, { args }, endedUplink, undefined, activeSignal)
+    }
+    return await gateway.openWireStream(endpoint, { args }, activeSignal)
+  }
+  throw new Error('typertGateway does not support stream opening')
+}
+
+/** Tier 2：从远端 `workspace/follow` 首帧 baseline 读取工作区列表与归档会话集合（带超时防挂起）。 */
+async function readRemoteGatewayWorkspaces(
+  gateway: HostTypertGateway,
+  signal?: AbortSignal,
+): Promise<{ workspaces: WorkspaceRow[]; archivedSessionIds: string[] }> {
+  const lifetime = new AbortController()
+  const timed = withRemoteTimeoutSignal(signal)
+  const activeSignal = AbortSignal.any([timed.signal, lifetime.signal])
+  try {
+    const stream = await openRemoteGatewayStream(gateway, 'workspace', 'follow', {}, activeSignal)
+    const iterator = stream[Symbol.asyncIterator]()
+    try {
+      const first = await new Promise<IteratorResult<unknown>>((resolve, reject) => {
+        const onAbort = (): void => {
+          reject(activeSignal.reason ?? new Error('workspace/follow timed out'))
+        }
+        if (activeSignal.aborted) {
+          onAbort()
+          return
+        }
+        activeSignal.addEventListener('abort', onAbort, { once: true })
+        iterator.next().then(
+          (res) => {
+            activeSignal.removeEventListener('abort', onAbort)
+            resolve(res)
+          },
+          (err) => {
+            activeSignal.removeEventListener('abort', onAbort)
+            reject(err)
+          },
+        )
+      })
+      const frame = isPlainRecord(first.value) ? first.value : undefined
+      const baseline = frame?.['type'] === 'baseline' && isPlainRecord(frame['value']) ? frame['value'] : frame
+      const rawItems = Array.isArray(baseline?.['items']) ? baseline['items'] : []
+      const workspaces: WorkspaceRow[] = []
+      for (const raw of rawItems) {
+        if (!isPlainRecord(raw)) continue
+        const workspaceId = nonEmptyString(raw['workspaceId']) ?? nonEmptyString(raw['id'])
+        const path = nonEmptyString(raw['path'])
+        if (workspaceId === undefined || path === undefined) continue
+        workspaces.push({
+          workspaceId,
+          path,
+          title: typeof raw['title'] === 'string' ? raw['title'] : '',
+          createdAt: typeof raw['createdAt'] === 'string' ? raw['createdAt'] : '',
+          updatedAt: typeof raw['updatedAt'] === 'string' ? raw['updatedAt'] : '',
+        })
+      }
+      const rawArchived = baseline?.['archivedSessionIds']
+      const archivedSessionIds: string[] = []
+      if (Array.isArray(rawArchived)) {
+        for (const id of rawArchived) {
+          const s = nonEmptyString(id)
+          if (s !== undefined) archivedSessionIds.push(s)
+        }
+      }
+      return { workspaces, archivedSessionIds }
+    } finally {
+      lifetime.abort()
+      await iterator.return?.().catch(() => undefined)
+    }
+  } catch {
+    return { workspaces: [], archivedSessionIds: [] }
+  } finally {
+    timed.cleanup()
+  }
+}
+
+/** Tier 2：从远端 `session/list` 读取全部会话并组装为 `SessionRow[]`。 */
+async function readRemoteGatewaySessions(
+  gateway: HostTypertGateway,
+  signal?: AbortSignal,
+): Promise<SessionRow[]> {
+  let rawResult: unknown
+  try {
+    rawResult = await invokeRemoteGateway(gateway, 'session', 'list', { _request: {} }, signal)
+  } catch {
+    try {
+      rawResult = await invokeRemoteGateway(gateway, 'session', 'list', { request: {} }, signal)
+    } catch {
+      return []
+    }
+  }
+  const items = Array.isArray(rawResult)
+    ? rawResult
+    : isPlainRecord(rawResult) && Array.isArray(rawResult['items'])
+      ? rawResult['items']
+      : []
+  const rows: SessionRow[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (!isPlainRecord(item)) continue
+    const summaryCandidate = item as SummaryLike
+    const id = summaryId(summaryCandidate)
+    if (id !== undefined) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      rows.push(toSessionRow(id, undefined, summaryCandidate))
+      continue
+    }
+    const header = isPlainRecord(item['header']) ? (item['header'] as PersistenceSnapshot['header']) : undefined
+    const headerId = nonEmptyString(header?.id)
+    if (headerId === undefined || seen.has(headerId)) continue
+    seen.add(headerId)
+    rows.push(toSessionRow(headerId, header, undefined))
+  }
+  attachLastActivityTimes(rows)
+  return rows
+}
+
+/** 解析 `.git/HEAD` 或 `.git/worktrees/<name>/HEAD` 的检出分支短名。 */
+function parseGitHeadBranch(text: string | undefined): string | undefined {
+  if (typeof text !== 'string') return undefined
+  const line = text.split(/\r?\n/, 1)[0]?.trim() ?? ''
+  if (line.startsWith('ref: refs/heads/')) {
+    const branch = line.slice('ref: refs/heads/'.length).trim()
+    return branch === '' ? undefined : branch
+  }
+  return undefined
+}
+
+/** 从关联 worktree 目录名或管理目录名推断分支名（无会话可读 `.git/worktrees/<name>/HEAD` 时的启发式兜底）。 */
+function inferRemoteWorktreeBranch(mainPath: string, wtPath: string, wtAdminName?: string): string | undefined {
+  const mainBase = basename(mainPath)
+  const wtBase = basename(wtPath)
+  if (mainBase !== '' && wtBase.startsWith(`${mainBase}-`) && wtBase.length > mainBase.length + 1) {
+    return wtBase.slice(mainBase.length + 1)
+  }
+  if (wtAdminName !== undefined && wtAdminName !== '') {
+    if (mainBase !== '' && wtAdminName.startsWith(`${mainBase}-`) && wtAdminName.length > mainBase.length + 1) {
+      return wtAdminName.slice(mainBase.length + 1)
+    }
+    return wtAdminName
+  }
+  return undefined
+}
+
+/**
+ * Tier 2：利用远端网关的 `directoryPicker/list` 与 `workspaceFiles/read` 探测机器 B 上的 git 仓库与 worktrees。
+ *
+ * 性能与防阻塞设计：
+ * - **只探测已注册工作区路径（`workspaces[*].path`）** 以及由关联 worktree `.git` 文件反推的主仓路径，**绝不**遍历全量历史会话的 `cwd`；
+ * - **支持 `<MainRepo>-<branch>` 命名启发式匹配**：当主仓或关联 worktree 下没有会话可供 `workspaceFiles/read` 读取 `gitdir`/`HEAD` 时，结合 `.git/worktrees/<wtName>` 与已注册工作区集合的命名约定（同父目录兄弟 `<MainRepo>-<branch>` 或 `worktrees/<MainRepo>-<branch>`）自动归并关联 worktree 并推断分支名；
+ * - **按 `(targetKey, workspaceSignature)` 进程内缓存**（TTL 30 s），工作区列表不变时零重复跨网目录探测。
+ */
+async function scanRemoteGatewayRepos(
+  gateway: HostTypertGateway,
+  targetKey: string,
+  workspaces: readonly WorkspaceRow[],
+  sessions: readonly SessionRow[],
+  now = Date.now(),
+  signal?: AbortSignal,
+): Promise<{
+  repos: Map<string, RepoInfo>
+  pathToCommonDir: Map<string, string>
+  liveWorkspacePaths: Set<string>
+}> {
+  const wsSig = workspaceSignature(workspaces)
+  const cachedScan = remoteRepoScanCache.get(targetKey)
+  if (
+    cachedScan !== undefined &&
+    cachedScan.workspaceSig === wsSig &&
+    now >= cachedScan.at &&
+    now - cachedScan.at < REMOTE_REPO_SCAN_CACHE_TTL_MS
+  ) {
+    return {
+      repos: new Map(cachedScan.repos),
+      pathToCommonDir: new Map(cachedScan.pathToCommonDir),
+      liveWorkspacePaths: new Set(cachedScan.liveWorkspacePaths),
+    }
+  }
+
+  const repos = new Map<string, RepoInfo>()
+  const pathToCommonDir = new Map<string, string>()
+  const liveWorkspacePaths = new Set<string>()
+
+  // 建立 归一化目录 → 可作 workspaceFileScopeId 的 sessionId 索引
+  const sessionByDir = new Map<string, { sessionId: string; cwd: string }>()
+  for (const session of sessions) {
+    const rawCwd = nonEmptyString(session.cwd)
+    if (rawCwd === undefined) continue
+    const normCwd = normalizePath(rawCwd)
+    if (!sessionByDir.has(normCwd)) {
+      sessionByDir.set(normCwd, { sessionId: session.sessionId, cwd: normCwd })
+    }
+  }
+
+  const dirCache = new Map<string, Promise<{ exists: boolean; entries: Array<{ name: string; path: string }> }>>()
+  const listRemoteDir = (
+    rawPath: string,
+  ): Promise<{ exists: boolean; entries: Array<{ name: string; path: string }> }> => {
+    const norm = normalizePath(rawPath)
+    const existing = dirCache.get(norm)
+    if (existing !== undefined) return existing
+    const pending = (async (): Promise<{ exists: boolean; entries: Array<{ name: string; path: string }> }> => {
+      try {
+        const res = await invokeRemoteGateway(gateway, 'directoryPicker', 'list', { path: norm }, signal)
+        const rawEntries = isPlainRecord(res) && Array.isArray(res['entries']) ? res['entries'] : []
+        const entries: Array<{ name: string; path: string }> = []
+        for (const item of rawEntries) {
+          if (!isPlainRecord(item)) continue
+          const name = nonEmptyString(item['name'])
+          const itemPath = nonEmptyString(item['path']) ?? (name !== undefined ? join(norm, name) : undefined)
+          if (name !== undefined && itemPath !== undefined) {
+            entries.push({ name, path: normalizePath(itemPath) })
+          }
+        }
+        return { exists: true, entries }
+      } catch {
+        return { exists: false, entries: [] }
+      }
+    })()
+    dirCache.set(norm, pending)
+    return pending
+  }
+
+  const readRemoteFile = async (dirPath: string, relPath: string): Promise<string | undefined> => {
+    const normDir = normalizePath(dirPath)
+    const directScope = sessionByDir.get(normDir)
+    if (directScope === undefined) return undefined
+    try {
+      const res = await invokeRemoteGateway(
+        gateway,
+        'workspaceFiles',
+        'read',
+        {
+          workspaceFileScopeId: directScope.sessionId,
+          path: relPath,
+          range: { offset: 1, limit: 20 },
+        },
+        signal,
+      )
+      if (isPlainRecord(res) && typeof res['text'] === 'string') {
+        return res['text'].trim()
+      }
+    } catch {
+      // 忽略：回退 undefined
+    }
+    return undefined
+  }
+
+  // 仅以已注册工作区路径作为探测候选（绝不加入全部历史会话的 cwd）
+  const workspacePaths = [...new Set(workspaces.map((ws) => normalizePath(ws.path)))]
+  // 会话中有 `.git` 文件可读的目录，仅在主树匹配 `.git/worktrees/<wtName>` 时按需查阅
+  const sessionDirsWithScope = [...sessionByDir.keys()]
+
+  const scanMainRepoAt = async (mainPathRaw: string): Promise<RepoInfo | null> => {
+    const mainPath = normalizePath(mainPathRaw)
+    const commonDir = normalizePath(join(mainPath, '.git'))
+    const existing = repos.get(commonDir)
+    if (existing !== undefined) return existing
+
+    const mainDirListing = await listRemoteDir(mainPath)
+    if (!mainDirListing.exists || !mainDirListing.entries.some((e) => e.name === '.git')) {
+      return null
+    }
+    const mainHeadText = await readRemoteFile(mainPath, '.git/HEAD')
+    const mainBranch = parseGitHeadBranch(mainHeadText)
+    const worktrees: WorktreeEntry[] = [
+      {
+        path: mainPath,
+        ...(mainBranch === undefined ? {} : { branch: mainBranch }),
+        isMain: true,
+        bare: false,
+        exists: true,
+      },
+    ]
+    const seenWorktreePaths = new Set<string>([mainPath])
+
+    const wtListing = await listRemoteDir(join(commonDir, 'worktrees'))
+    if (wtListing.exists && wtListing.entries.length > 0) {
+      for (const wtAdmin of wtListing.entries) {
+        const wtName = wtAdmin.name
+        const [gitdirText, headText] = await Promise.all([
+          readRemoteFile(mainPath, `.git/worktrees/${wtName}/gitdir`),
+          readRemoteFile(mainPath, `.git/worktrees/${wtName}/HEAD`),
+        ])
+        let wtPath: string | undefined
+        if (gitdirText !== undefined && gitdirText !== '') {
+          const line = gitdirText.split(/\r?\n/, 1)[0]?.trim() ?? ''
+          if (line !== '') {
+            wtPath = normalizePath(line.replace(/[/\\]\.git[/\\]?$/, ''))
+          }
+        }
+        // 回退 1：优先在已注册工作区路径中按目录名精确匹配 wtName 或 <MainRepo>-<wtName>
+        if (wtPath === undefined) {
+          const mainBase = basename(mainPath)
+          const hitWs = workspacePaths.find((cand) => {
+            if (cand === mainPath || seenWorktreePaths.has(cand)) return false
+            const candBase = basename(cand)
+            return candBase === wtName || (mainBase !== '' && candBase === `${mainBase}-${wtName}`)
+          })
+          if (hitWs !== undefined) wtPath = hitWs
+        }
+        // 回退 2：在拥有活跃会话 scope 的目录中尝试读 `.git` 文件反查
+        if (wtPath === undefined) {
+          const expectedSuffix = `/.git/worktrees/${wtName}`
+          for (const cand of sessionDirsWithScope) {
+            if (cand === mainPath || seenWorktreePaths.has(cand)) continue
+            const dotGit = await readRemoteFile(cand, '.git')
+            if (dotGit !== undefined && normalizePath(dotGit.replace(/^gitdir:\s*/i, '')).endsWith(expectedSuffix)) {
+              wtPath = cand
+              break
+            }
+          }
+        }
+        // 回退 3：同父目录兄弟目录查找
+        if (wtPath === undefined) {
+          const parentListing = await listRemoteDir(dirname(mainPath))
+          const hit = parentListing.entries.find(
+            (e) => e.name === wtName || e.name === `${basename(mainPath)}-${wtName}`,
+          )
+          if (hit !== undefined) wtPath = hit.path
+        }
+        if (wtPath === undefined || seenWorktreePaths.has(wtPath)) continue
+        seenWorktreePaths.add(wtPath)
+        const wtDirListing = await listRemoteDir(wtPath)
+        const branch = parseGitHeadBranch(headText) ?? inferRemoteWorktreeBranch(mainPath, wtPath, wtName)
+        worktrees.push({
+          path: wtPath,
+          ...(branch === undefined ? {} : { branch }),
+          isMain: false,
+          bare: false,
+          exists: wtDirListing.exists,
+        })
+      }
+    }
+
+    const repo: RepoInfo = { commonDir, mainPath, worktrees }
+    repos.set(commonDir, repo)
+    pathToCommonDir.set(mainPath, commonDir)
+    pathToCommonDir.set(commonDir, commonDir)
+    for (const wt of worktrees) {
+      pathToCommonDir.set(normalizePath(wt.path), commonDir)
+    }
+    return repo
+  }
+
+  // 第一轮：并行预热全部已注册工作区目录列表，并识别所有包含 `.git` 子目录的主工作树
+  const wsListings = await Promise.all(
+    workspacePaths.map(async (norm) => ({ norm, listing: await listRemoteDir(norm) })),
+  )
+  for (const { norm, listing } of wsListings) {
+    if (listing.exists) liveWorkspacePaths.add(norm)
+    if (listing.exists && listing.entries.some((e) => e.name === '.git')) {
+      await scanMainRepoAt(norm)
+    }
+  }
+
+  // 第二轮：对尚未归入任何 git 仓的已注册工作区，检查其 `.git` 文件或命名启发式（`<MainRepo>-<branch>`）
+  for (const { norm: cand, listing } of wsListings) {
+    if (pathToCommonDir.has(cand) || !listing.exists) continue
+    const dotGit = await readRemoteFile(cand, '.git')
+    if (dotGit !== undefined && /^gitdir:/i.test(dotGit)) {
+      const rawTarget = dotGit.replace(/^gitdir:\s*/i, '').split(/\r?\n/, 1)[0]?.trim() ?? ''
+      const normTarget = normalizePath(rawTarget.startsWith('/') ? rawTarget : join(cand, rawTarget))
+      const match = /^(.*\/\.git)\/worktrees\/([^/]+)\/?$/.exec(normTarget)
+      if (match !== null) {
+        const commonDir = normalizePath(match[1])
+        const mainPath = normalizePath(dirname(commonDir))
+        const scanned = await scanMainRepoAt(mainPath)
+        if (scanned !== null) {
+          pathToCommonDir.set(cand, scanned.commonDir)
+          continue
+        }
+      }
+    }
+    // 命名启发式兜底：若已识别的主仓 `mainPath` 满足 `<MainRepo>-<branch>`（同父目录或位于同级/子级 `worktrees/` 目录）
+    for (const [commonDir, repo] of repos) {
+      const mainPath = normalizePath(repo.mainPath)
+      const mainBase = basename(mainPath)
+      const candBase = basename(cand)
+      if (mainBase === '' || !candBase.startsWith(`${mainBase}-`) || candBase.length <= mainBase.length + 1) {
+        continue
+      }
+      const sameParent = dirname(cand) === dirname(mainPath)
+      const inWorktreesDir =
+        basename(dirname(cand)).toLowerCase().includes('worktree') &&
+        (dirname(dirname(cand)) === dirname(mainPath) || dirname(dirname(cand)) === mainPath)
+      if (!sameParent && !inWorktreesDir) continue
+      if (!repo.worktrees.some((w) => normalizePath(w.path) === cand)) {
+        const inferredBranch = inferRemoteWorktreeBranch(mainPath, cand)
+        repo.worktrees.push({
+          path: cand,
+          ...(inferredBranch === undefined ? {} : { branch: inferredBranch }),
+          isMain: false,
+          bare: false,
+          exists: true,
+        })
+      }
+      pathToCommonDir.set(cand, commonDir)
+      break
+    }
+  }
+
+  remoteRepoScanCache.set(targetKey, {
+    at: now,
+    workspaceSig: wsSig,
+    repos: new Map(repos),
+    pathToCommonDir: new Map(pathToCommonDir),
+    liveWorkspacePaths: new Set(liveWorkspacePaths),
+  })
+
+  return { repos, pathToCommonDir, liveWorkspacePaths }
+}
+
+/**
+ * Tier 2：通过远端 `ctx.typertGateway` 收集远端机器 B 的完整树快照。
+ */
+async function collectRemoteGatewaySnapshot(
+  ctx: Context,
+  targetKey: string,
+  options: SnapshotOptions = {},
+): Promise<TreeSnapshot> {
+  const signal = options.signal
+  const ledger = remoteLedgerStore(targetKey)
+  const ledgerData = await ledger.read()
+  const gateway = getOptionalService<HostTypertGateway>(ctx, 'typertGateway')
+
+  if (gateway === undefined) {
+    return {
+      workspaces: [],
+      sessions: [],
+      archivedSessionIds: [],
+      repos: {},
+      repoByWorkspacePath: {},
+      workspaceByPath: {},
+      ledger: ledgerData,
+      knownWorktreePaths: new Set(),
+      knownRepoPaths: new Set(),
+      mainPathByKnownPath: new Map(),
+      liveWorkspacePaths: new Set(),
+      nonMainWorkspacePaths: new Set(),
+    }
+  }
+
+  const [{ workspaces, archivedSessionIds }, sessions] = await Promise.all([
+    readRemoteGatewayWorkspaces(gateway, signal),
+    readRemoteGatewaySessions(gateway, signal),
+  ])
+
+  const { repos, pathToCommonDir, liveWorkspacePaths } = await scanRemoteGatewayRepos(
+    gateway,
+    targetKey,
+    workspaces,
+    sessions,
+    options.now ?? Date.now(),
+    signal,
+  )
+
+  const repoByWorkspacePath: Record<string, string> = {}
+  const workspaceByPath: Record<string, string> = {}
+  for (const workspace of workspaces) {
+    const path = normalizePath(workspace.path)
+    if (workspaceByPath[path] === undefined) workspaceByPath[path] = workspace.workspaceId
+    const direct = pathToCommonDir.get(path)
+    if (direct !== undefined) {
+      repoByWorkspacePath[path] = direct
+      continue
+    }
+    for (const [commonDir, repo] of repos) {
+      if (normalizePath(repo.mainPath) === path || repo.worktrees.some((e) => normalizePath(e.path) === path)) {
+        repoByWorkspacePath[path] = commonDir
+        break
+      }
+    }
+  }
+
+  const knownWorktreePaths = new Set<string>()
+  const knownRepoPaths = new Set<string>()
+  const mainPathByKnownPath = new Map<string, string>()
+  for (const [commonDir, repo] of repos) {
+    const mainPath = normalizePath(repo.mainPath)
+    knownRepoPaths.add(normalizePath(commonDir))
+    knownRepoPaths.add(mainPath)
+    mainPathByKnownPath.set(normalizePath(commonDir), mainPath)
+    mainPathByKnownPath.set(mainPath, mainPath)
+    for (const entry of repo.worktrees) {
+      const wtPath = normalizePath(entry.path)
+      knownWorktreePaths.add(wtPath)
+      knownRepoPaths.add(wtPath)
+      if (!mainPathByKnownPath.has(wtPath)) mainPathByKnownPath.set(wtPath, mainPath)
+    }
+  }
+  for (const ws of workspaces) {
+    const p = normalizePath(ws.path)
+    knownWorktreePaths.add(p)
+    knownRepoPaths.add(p)
+  }
+
+  const repoRecord: Record<string, RepoInfo> = {}
+  for (const [commonDir, repo] of repos) repoRecord[commonDir] = repo
+
+  return {
+    workspaces,
+    sessions,
+    archivedSessionIds,
+    repos: repoRecord,
+    repoByWorkspacePath,
+    workspaceByPath,
+    ledger: ledgerData,
+    knownWorktreePaths,
+    knownRepoPaths,
+    mainPathByKnownPath,
+    liveWorkspacePaths,
+    nonMainWorkspacePaths: new Set(),
+  }
+}
+
+/**
+ * Tier 2：在远端网关上打开或创建工作区（`POST /workspace-open` 回退）。
+ */
+async function openRemoteGatewayWorkspace(
+  ctx: Context,
+  rawPath: string,
+  signal?: AbortSignal,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  const gateway = getOptionalService<HostTypertGateway>(ctx, 'typertGateway')
+  if (gateway === undefined) {
+    return { status: 400, payload: { ok: false, message: '远端网关未就绪，无法注册工作区' } }
+  }
+  const norm = normalizePath(rawPath)
+  try {
+    const { workspaces } = await readRemoteGatewayWorkspaces(gateway, signal)
+    const existing = workspaces.find((w) => normalizePath(w.path) === norm)
+    if (existing !== undefined) {
+      return { status: 200, payload: { ok: true, workspaceId: existing.workspaceId } }
+    }
+    const created = await invokeRemoteGateway(gateway, 'workspace', 'create', { request: { path: norm } }, signal)
+    const record = isPlainRecord(created)
+      ? isPlainRecord(created['workspace'])
+        ? created['workspace']
+        : created
+      : undefined
+    const workspaceId = nonEmptyString(record?.['workspaceId']) ?? nonEmptyString(record?.['id'])
+    if (workspaceId === undefined) {
+      return { status: 400, payload: { ok: false, message: '远端工作区注册未返回 id' } }
+    }
+    return { status: 200, payload: { ok: true, workspaceId } }
+  } catch (error) {
+    return { status: 400, payload: { ok: false, message: failMessage(error) } }
+  }
+}
+
+/**
+ * 在本机 `ctx` 上执行单个 `dsh-worktree-groups` 路由请求（供机器 B 作为 Host 响应 Tier 1 转发使用）。
+ */
+async function dispatchLocalWorktreePluginCall(
+  ctx: Context,
+  rawBody: unknown,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  const envelope = isPlainRecord(rawBody) ? rawBody : {}
+  const endpoint = nonEmptyString(envelope['endpoint']) ?? 'tree'
+  const body = isPlainRecord(envelope['payload']) ? envelope['payload'] : {}
+  const hostLedger = getOptionalService<HostDshRemote>(ctx, 'dshRemote')?.ledger
+  const localOpts: SnapshotOptions =
+    hostLedger === undefined ? { forceLocal: true } : { forceLocal: true, ledger: hostLedger }
+
+  const collectResponse = async (
+    runner: (res: ServerResponse) => Promise<void>,
+  ): Promise<{ status: number; payload: Record<string, unknown> }> => {
+    let capturedStatus = 200
+    let capturedText = '{}'
+    const fakeResObj = {
+      headersSent: false,
+      writeHead(status: number) {
+        capturedStatus = status
+        fakeResObj.headersSent = true
+        return fakeResObj
+      },
+      end(chunk?: unknown) {
+        if (typeof chunk === 'string') capturedText = chunk
+        fakeResObj.headersSent = true
+        return fakeResObj
+      },
+    }
+    const fakeRes = fakeResObj as unknown as ServerResponse
+    await runner(fakeRes)
+    try {
+      const parsed: unknown = JSON.parse(capturedText)
+      return {
+        status: capturedStatus,
+        payload: isPlainRecord(parsed) ? parsed : { ok: false, message: capturedText },
+      }
+    } catch {
+      return { status: capturedStatus, payload: { ok: false, message: capturedText } }
+    }
+  }
+
+  try {
+    if (endpoint === 'tree') {
+      const archiveProjectKey = bodyString(body, 'archiveProjectKey')
+      const unarchiveProjectKey = bodyString(body, 'unarchiveProjectKey')
+      const unarchivePath = bodyString(body, 'unarchivePath')
+      if (archiveProjectKey !== undefined) {
+        await archiveWorkspaceProject(ctx, archiveProjectKey, localOpts)
+      }
+      if (unarchiveProjectKey !== undefined || unarchivePath !== undefined) {
+        await unarchiveWorkspaceProject(
+          ctx,
+          {
+            ...(unarchiveProjectKey === undefined ? {} : { projectKey: unarchiveProjectKey }),
+            ...(unarchivePath === undefined ? {} : { path: unarchivePath }),
+          },
+          localOpts,
+        )
+      }
+      const payload = await buildTreePayload(ctx, { ...localOpts, reuseSessions: true })
+      return { status: 200, payload: payload as unknown as Record<string, unknown> }
+    }
+    if (endpoint === 'worktree-create') {
+      return await collectResponse((res) => handleWorktreeCreate(ctx, res, body, localOpts))
+    }
+    if (endpoint === 'worktree-remove') {
+      return await collectResponse((res) => handleWorktreeRemove(ctx, res, body, localOpts))
+    }
+    if (endpoint === 'reveal') {
+      return await collectResponse((res) => handleReveal(ctx, res, body, localOpts))
+    }
+    if (endpoint === 'workspace-open') {
+      const path = bodyString(body, 'path')
+      if (path === undefined) return { status: 400, payload: { ok: false, message: '缺少 path' } }
+      const registry = getService<HostWorkspaceRegistry>(ctx, 'workspaceRegistry')
+      if (typeof registry?.create !== 'function') {
+        return { status: 400, payload: { ok: false, message: '宿主未提供 workspaceRegistry，无法注册工作区' } }
+      }
+      const created = await registry.create(normalizePath(path))
+      const workspaceId = nonEmptyString(created?.id)
+      if (workspaceId === undefined) {
+        return { status: 400, payload: { ok: false, message: '工作区注册未返回 id' } }
+      }
+      try {
+        await unarchiveWorkspaceProject(ctx, { path }, localOpts)
+      } catch {
+        // 忽略
+      }
+      return { status: 200, payload: { ok: true, workspaceId } }
+    }
+    return { status: 400, payload: { ok: false, message: `未知 endpoint: ${endpoint}` } }
+  } catch (error) {
+    return { status: 400, payload: { ok: false, message: failMessage(error) } }
+  }
+}
+
+/** 已挂载过 Tier 1 远端桥的路由器 / 连接控制器（绑定到最新 `Context`）。 */
+const routerOwnerCtx = new WeakMap<object, Context>()
+const connectionsOwnerCtx = new WeakMap<object, Context>()
+
+function wrapRemoteHostRouter(router: RemoteHostRouterLike | undefined, ctx: Context): void {
+  if (router === undefined || typeof router !== 'object' || router === null) return
+  const alreadyWrapped = routerOwnerCtx.has(router)
+  routerOwnerCtx.set(router, ctx)
+  if (alreadyWrapped) return
+
+  const pluginRoute = router.pluginRoute
+  if (pluginRoute !== undefined && typeof pluginRoute === 'object' && typeof pluginRoute.call === 'function') {
+    const originalCall = pluginRoute.call.bind(pluginRoute)
+    pluginRoute.call = async (input: unknown, transferred?: boolean): Promise<{ status: number; json: unknown }> => {
+      if (isPlainRecord(input) && input['route'] === REMOTE_PLUGIN_ROUTE) {
+        const currentCtx = routerOwnerCtx.get(router) ?? ctx
+        const result = await dispatchLocalWorktreePluginCall(currentCtx, input['body'])
+        return { status: result.status, json: result.payload }
+      }
+      return await originalCall(input, transferred)
+    }
+  }
+
+  if (typeof router.handle === 'function') {
+    const originalHandle = router.handle.bind(router)
+    router.handle = async (message: unknown): Promise<unknown> => {
+      if (
+        router.pluginRoute === undefined &&
+        isPlainRecord(message) &&
+        message['type'] === 'rpc.request' &&
+        isPlainRecord(message['payload']) &&
+        message['payload']['method'] === 'plugin.route.call' &&
+        isPlainRecord(message['payload']['params']) &&
+        message['payload']['params']['route'] === REMOTE_PLUGIN_ROUTE
+      ) {
+        const currentCtx = routerOwnerCtx.get(router) ?? ctx
+        const result = await dispatchLocalWorktreePluginCall(currentCtx, message['payload']['params']['body'])
+        const reqId = message['id']
+        return {
+          id: reqId,
+          type: 'rpc.response',
+          timestamp: Date.now(),
+          payload: {
+            requestId: reqId,
+            result: { status: result.status, json: result.payload },
+          },
+        }
+      }
+      return await originalHandle(message)
+    }
+  }
+}
+
+/**
+ * 在机器 B 的 `ctx.dshRemote`（`HostPluginRuntime`）上挂载 Tier 1 路由处理器。
+ *
+ * 刻意不调用 `ctx.effect`（保持 `registerRoutes` 的 5 个路由 effect 契约不变）。
+ */
+function attachRemoteHostBridge(ctx: Context): void {
+  const tryHook = (): void => {
+    const dshRemote = getOptionalService<HostDshRemote>(ctx, 'dshRemote')
+    const connections = dshRemote?.connections
+    if (connections === undefined || typeof connections !== 'object' || connections === null) return
+
+    if (connections.active instanceof Map) {
+      for (const entry of connections.active.values()) {
+        wrapRemoteHostRouter(entry?.router, ctx)
+      }
+    }
+
+    const alreadyHooked = connectionsOwnerCtx.has(connections)
+    connectionsOwnerCtx.set(connections, ctx)
+    if (!alreadyHooked && typeof connections.createRouter === 'function') {
+      const originalCreateRouter = connections.createRouter.bind(connections)
+      connections.createRouter = (connCtx: unknown, send: unknown): RemoteHostRouterLike => {
+        const router = originalCreateRouter(connCtx, send)
+        const currentCtx = connectionsOwnerCtx.get(connections) ?? ctx
+        wrapRemoteHostRouter(router, currentCtx)
+        return router
+      }
+    }
+  }
+
+  tryHook()
+  try {
+    const on = (ctx as unknown as { on?: (event: string, listener: (...args: unknown[]) => void) => unknown }).on
+    if (typeof on === 'function') {
+      on.call(ctx, 'internal/service', (name: unknown) => {
+        if (name === 'dshRemote') tryHook()
+      })
+    }
+  } catch {
+    // 忽略
+  }
+}
+
 /**
  * 收集一次请求需要的全部宿主事实。
  *
  * 全部服务都是**惰性 + 可选**：任何一个缺席都只让对应部分为空，不抛错。
  */
 export async function collectSnapshot(ctx: Context, options: SnapshotOptions = {}): Promise<TreeSnapshot> {
+  if (options.forceLocal !== true) {
+    const remote = readRemoteClientState(ctx)
+    if (remote.isRemote) {
+      return await collectRemoteGatewaySnapshot(ctx, remote.targetKey, options)
+    }
+  }
+
   const now = options.now ?? Date.now()
   const signal = options.signal
   const ledger = options.ledger ?? (await ledgerStore())
@@ -1074,12 +2184,26 @@ export async function buildTreePayload(
   options: SnapshotOptions = {},
   precomputed?: TreePayload,
 ): Promise<TreePayload> {
-  const snapshot = await collectSnapshot(ctx, options)
+  const remoteState = options.forceLocal === true ? { isRemote: false, targetKey: 'local' } : readRemoteClientState(ctx)
+  if (remoteState.isRemote && precomputed === undefined) {
+    const tier1 = await tryCallRemotePluginRoute(ctx, 'tree', {}, options.signal, options.now ?? Date.now())
+    if (tier1.supported && tier1.payload['ok'] === true && Array.isArray(tier1.payload['projects'])) {
+      return tier1.payload as unknown as TreePayload
+    }
+  }
+
+  const effectiveOptions: SnapshotOptions = remoteState.isRemote
+    ? { ...options, ledger: remoteLedgerStore(remoteState.targetKey) }
+    : options
+  const snapshot = await collectSnapshot(ctx, effectiveOptions)
 
   // D18：先清扫「目录已死且非主工作树」的工作区记录，**再**合成树。
   // 这样死工作区不会出现在本轮响应里，其会话随即由规则 3/4 落进 history 桶。
   // 清扫失败不影响本轮渲染（规则 2 的 exists 校验已保证会话不会被扣在死节点上）。
-  const swept = await sweepDeadWorkspaces(ctx, snapshot)
+  // ⚠️ 远端模式下禁止对本机 workspaceRegistry 执行清扫（AC3）。
+  const swept = remoteState.isRemote
+    ? { removed: [] as string[], failed: [] as Array<{ workspaceId: string; path: string; message: string }> }
+    : await sweepDeadWorkspaces(ctx, snapshot)
   if (swept.removed.length > 0 || swept.failed.length > 0) {
     // 重新读一次注册表，让本轮响应反映清扫结果。
     const refreshed = loadWorkspaces(ctx)
@@ -1129,7 +2253,7 @@ export async function buildTreePayload(
   const ungrouped = collectUngrouped(input, built.projects)
 
   try {
-    await updateLedger(snapshot, options, built.projects)
+    await updateLedger(snapshot, effectiveOptions, built.projects)
   } catch {
     // 台账写失败不阻塞渲染。
   }
@@ -1199,9 +2323,12 @@ export async function archiveWorkspaceProject(
   const key = projectKey.trim()
   if (key === '') return { ok: false, archivedProjects: {} }
 
+  const remoteState = options.forceLocal === true ? { isRemote: false, targetKey: 'local' } : readRemoteClientState(ctx)
   const now = options.now ?? Date.now()
-  const ledger = options.ledger ?? (await ledgerStore())
-  const snapshot = await collectSnapshot(ctx, options)
+  const ledger = remoteState.isRemote
+    ? remoteLedgerStore(remoteState.targetKey)
+    : (options.ledger ?? (await ledgerStore()))
+  const snapshot = await collectSnapshot(ctx, { ...options, ledger })
   const built = buildProjects({
     workspaces: snapshot.workspaces,
     repos: snapshot.repos,
@@ -1251,7 +2378,10 @@ export async function unarchiveWorkspaceProject(
   target: { projectKey?: string; path?: string },
   options: SnapshotOptions = {},
 ): Promise<{ ok: boolean; unarchivedKeys: string[] }> {
-  const ledger = options.ledger ?? (await ledgerStore())
+  const remoteState = options.forceLocal === true ? { isRemote: false, targetKey: 'local' } : readRemoteClientState(ctx)
+  const ledger = remoteState.isRemote
+    ? remoteLedgerStore(remoteState.targetKey)
+    : (options.ledger ?? (await ledgerStore()))
   const currentLedger = await ledger.read()
   const archivedMap = currentLedger.archivedProjects ?? {}
   if (Object.keys(archivedMap).length === 0) {
@@ -1266,11 +2396,13 @@ export async function unarchiveWorkspaceProject(
 
   if (typeof target.path === 'string' && target.path.trim() !== '') {
     const normPath = normalizePath(target.path.trim())
-    const realNormPath = await realpath(normPath)
-      .then((resolved) => normalizePath(resolved))
-      .catch(() => normPath)
+    const realNormPath = remoteState.isRemote
+      ? normPath
+      : await realpath(normPath)
+          .then((resolved) => normalizePath(resolved))
+          .catch(() => normPath)
     const candidatePaths = new Set<string>([normPath, realNormPath])
-    const snapshot = await collectSnapshot(ctx, options)
+    const snapshot = await collectSnapshot(ctx, { ...options, ledger })
     // 1. 直接匹配已归档条目的 path
     for (const [key, entry] of Object.entries(archivedMap)) {
       if (entry.path !== undefined && candidatePaths.has(normalizePath(entry.path))) {
@@ -1298,7 +2430,7 @@ export async function unarchiveWorkspaceProject(
       }
     }
     // 4. 若该路径是尚未注册的新 worktree 目录，尝试直接跑一次 scanRepo 反查 commonDir
-    if (keysToRemove.size === 0) {
+    if (keysToRemove.size === 0 && !remoteState.isRemote) {
       try {
         const scanned = await scanRepo(normPath, options.signal)
         if (scanned !== null && archivedMap[scanned.commonDir] !== undefined) {
@@ -1866,6 +2998,7 @@ export function registerRoutes(ctx: Context): void {
   // 刻意**不**用 `ctx.effect`：监听器的生命周期由 Cordis 上下文负责，返回的 disposer
   // 已足够；路由注册的 effect 数量因此仍是 5（§7 的注册契约测试逐字断言）。
   registerSessionActivityObserver(ctx)
+  attachRemoteHostBridge(ctx)
 
   const register = (path: string, label: string, handler: RouteHandler): void => {
     ctx.effect(
@@ -1890,9 +3023,11 @@ export function registerRoutes(ctx: Context): void {
   // PERF1：`/tree` 计算合并器 —— 在途计算期间到达的请求共享**下一次**计算（保证看到
   // 自己到达之前的全部变更），同一时刻至多一个在途 + 一个排队。
   const treeFlight = createTreeFlight(async () => {
+    const remoteState = readRemoteClientState(ctx)
     const payload = await buildTreePayload(ctx, { reuseSessions: true })
     const body = JSON.stringify(payload)
-    return { body, etag: `"${createHash('sha1').update(body).digest('base64url')}"` }
+    const etag = `"${createHash('sha1').update(`${remoteState.targetKey}\u0000${body}`).digest('base64url')}"`
+    return { body, etag }
   })
 
   register(ROUTE_PATHS.tree, 'tree', async (req, res) => {
@@ -1901,6 +3036,25 @@ export function registerRoutes(ctx: Context): void {
       const archiveProjectKey = bodyString(body, 'archiveProjectKey')
       const unarchiveProjectKey = bodyString(body, 'unarchiveProjectKey')
       const unarchivePath = bodyString(body, 'unarchivePath')
+      const hasMutation =
+        archiveProjectKey !== undefined || unarchiveProjectKey !== undefined || unarchivePath !== undefined
+
+      const remoteState = readRemoteClientState(ctx)
+      if (remoteState.isRemote && hasMutation) {
+        const tier1 = await tryCallRemotePluginRoute(ctx, 'tree', body)
+        if (tier1.supported && tier1.payload['ok'] === true && Array.isArray(tier1.payload['projects'])) {
+          const text = JSON.stringify(tier1.payload)
+          const etag = `"${createHash('sha1').update(`${remoteState.targetKey}\u0000${text}`).digest('base64url')}"`
+          res.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            etag,
+            'cache-control': 'no-cache',
+          })
+          res.end(text)
+          return
+        }
+      }
+
       if (archiveProjectKey !== undefined) {
         await archiveWorkspaceProject(ctx, archiveProjectKey)
       }
@@ -1947,6 +3101,20 @@ export function registerRoutes(ctx: Context): void {
     const body = await readBody(req)
     const path = bodyString(body, 'path')
     if (path === undefined) return json(res, 400, { ok: false, message: '缺少 path' })
+    const remoteState = readRemoteClientState(ctx)
+    if (remoteState.isRemote) {
+      const tier1 = await tryCallRemotePluginRoute(ctx, 'workspace-open', body)
+      if (tier1.supported) {
+        return json(res, tier1.status, tier1.payload)
+      }
+      const tier2 = await openRemoteGatewayWorkspace(ctx, path)
+      try {
+        await unarchiveWorkspaceProject(ctx, { path })
+      } catch {
+        // 自动解除归档失败不阻塞打开工作区
+      }
+      return json(res, tier2.status, tier2.payload)
+    }
     const registry = getService<HostWorkspaceRegistry>(ctx, 'workspaceRegistry')
     if (typeof registry?.create !== 'function') {
       return json(res, 400, { ok: false, message: '宿主未提供 workspaceRegistry，无法注册工作区' })
@@ -1974,6 +3142,17 @@ export async function handleWorktreeCreate(
   body: Record<string, unknown>,
   options: SnapshotOptions = {},
 ): Promise<void> {
+  if (options.forceLocal !== true && readRemoteClientState(ctx).isRemote) {
+    const tier1 = await tryCallRemotePluginRoute(ctx, 'worktree-create', body, options.signal)
+    if (tier1.supported) {
+      return json(res, tier1.status, tier1.payload)
+    }
+    return json(res, 400, {
+      ok: false,
+      message: '远端主机上的 dsh-worktree-groups 插件尚未升级支持远程创建 worktree',
+    })
+  }
+
   const repoPathRaw = bodyString(body, 'repoPath')
   const branch = bodyString(body, 'branch')
   const createBranch = body['createBranch'] !== false
@@ -2076,6 +3255,17 @@ export async function handleWorktreeRemove(
   body: Record<string, unknown>,
   options: SnapshotOptions = {},
 ): Promise<void> {
+  if (options.forceLocal !== true && readRemoteClientState(ctx).isRemote) {
+    const tier1 = await tryCallRemotePluginRoute(ctx, 'worktree-remove', body, options.signal)
+    if (tier1.supported) {
+      return json(res, tier1.status, tier1.payload)
+    }
+    return json(res, 400, {
+      ok: false,
+      message: '远端主机上的 dsh-worktree-groups 插件尚未升级支持远程移除 worktree',
+    })
+  }
+
   const force = body['force'] === true
 
   let snapshot: TreeSnapshot
@@ -2186,6 +3376,17 @@ export async function handleReveal(
   body: Record<string, unknown>,
   options: SnapshotOptions = {},
 ): Promise<void> {
+  if (options.forceLocal !== true && readRemoteClientState(ctx).isRemote) {
+    const tier1 = await tryCallRemotePluginRoute(ctx, 'reveal', body, options.signal)
+    if (tier1.supported) {
+      return json(res, tier1.status, tier1.payload)
+    }
+    return json(res, 400, {
+      ok: false,
+      message: '远端主机上的 dsh-worktree-groups 插件尚未升级支持远程打开目录',
+    })
+  }
+
   let snapshot: TreeSnapshot
   try {
     snapshot = await collectSnapshot(ctx, options)

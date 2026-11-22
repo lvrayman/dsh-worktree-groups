@@ -2082,8 +2082,18 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   const sources = sourcesRef.current
 
   const sessionsSnapshot = sources.sessions(identity) as SessionsSnapshot | undefined
-  // 订阅工作区快照：树数据本身走 HTTP，这里只为驱动"重取"。
-  sources.workspaces(identity)
+  // 订阅工作区快照：树数据本身走 HTTP，这里派生签名以驱动防抖重取（含 dsh remote 切换远端工作区基线到达）。
+  const workspacesSnapshot = sources.workspaces(identity) as
+    | { items?: ReadonlyArray<{ workspaceId?: unknown; path?: unknown; title?: unknown; updatedAt?: unknown }> }
+    | undefined
+  const workspacesSignature = Array.isArray(workspacesSnapshot?.items)
+    ? workspacesSnapshot.items
+        .map(
+          (w) =>
+            `${String(w?.workspaceId ?? '')}:${String(w?.path ?? '')}:${String(w?.title ?? '')}:${String(w?.updatedAt ?? '')}`,
+        )
+        .join('|')
+    : ''
   // D2：两个 live-fact 快照的**返回值必须真正读出来** —— 只调用不接收会让订阅变死代码。
   // 无条件订阅（hook 调用顺序恒定），取值只在渲染会话行时用（见 `withLiveState`）。
   const sessionStatus = sources.status(identity)
@@ -2245,7 +2255,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   useEffect(() => {
     const timer = setTimeout(reload, RELOAD_DEBOUNCE_MS)
     return () => { clearTimeout(timer) }
-  }, [reload, pendingLiveSignature, currentSessionId, runningSignatureValue])
+  }, [reload, pendingLiveSignature, workspacesSignature, currentSessionId, runningSignatureValue])
 
   // 首拉 + 5s 轮询（隐藏时跳过）+ 窗口聚焦 / 重新可见强刷（D13）+ 归档工作空间变更即时刷新。
   useEffect(() => {

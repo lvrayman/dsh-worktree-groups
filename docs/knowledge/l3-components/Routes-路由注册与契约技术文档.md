@@ -11,6 +11,10 @@ level: L3
 > **文件路径**: `src/routes.ts`
 > **父文档**: [Routes技术文档.md](./Routes技术文档.md)（概览 + 子文档索引）
 
+> ⚠️ **2026-11-22 定点修订（dsh remote 远程控制模式）**：
+> - `registerRoutes` 在注册路由前调用 `attachRemoteHostBridge(ctx)`（不占 `ctx.effect`，路由 effect 数量仍为 5），在机器 B 的 `ctx.dshRemote.connections` 上拦截 `plugin.route.call`（`route: 'dsh-worktree-groups'`）。
+> - 当机器 A 处于 `ctx.get('dshRemoteClient')?.status?.()?.mode === 'remote'` 时，5 个端点优先经 Tier 1 转发至机器 B 执行；机器 B 未升级 Tier 1 时，`/tree` 与 `/workspace-open` 自动走 Tier 2 远端 `typertGateway` 回退，`/tree` 的 ETag 计算纳入 `remoteState.targetKey`（`local` vs `remote:<deviceId>:<backend>`）以防切换串台。详见 [工作记录 2026-11-22](../../worklog/2026-11-22-remote-worktree-display.md) 与 [INTERFACES.md §1.5](../../INTERFACES.md)。
+
 本文是 `src/routes.ts` 的功能拆分文档之一，覆盖 **路由注册与装配、路由清单与导出符号、
 5 个 HTTP 端点的逐个契约（请求字段、响应结构、错误码）、代码示例**。
 路径校验、白名单与 git 参数安全见

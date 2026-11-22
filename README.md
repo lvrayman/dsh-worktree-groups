@@ -21,9 +21,9 @@ DeepSeek Harness 原生侧栏（`@deepseek-ai/dsh-client-ui-workspace`，占据 
 
 `dsh-worktree-groups` 以 `priority: -1` 接管 `sidebar.workspaces` 槽位，通过 Git `commonDir` 自动将同一仓库下的所有 worktree 归并到同一个项目节点下，并提供未注册 worktree 自动发现、懒注册、一键新建/移除 worktree、已删 worktree 历史会话回收桶、三层拖拽排序与渐进式展开。
 
-已支持 DeepSeek Harness 桌面版（Desktop）与 Web Host，安装最新版即可使用：
+已支持 DeepSeek Harness 桌面版（Desktop）、Web Host 以及 `ds-harness-remote`（`dsh remote` 远程控制模式），安装最新版即可使用：
 
-`dsh-worktree-groups@0.1.1`
+`dsh-worktree-groups@0.1.2`
 
 ## 界面结构预览
 
