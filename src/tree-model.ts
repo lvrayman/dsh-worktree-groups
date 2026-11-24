@@ -1637,8 +1637,28 @@ function allSessionsOf(source: TopZoneObservationSource): SessionRowLike[] {
  * @param input 与 `buildRows` 同一份入参。
  * @returns 每条输入会话一条观测（顺序 = `allSessionsOf` 的顺序），**后接**归档 id 观测。
  */
+/**
+ * 把归档会话 id 列表归一为无 `session-` 前缀的集合（2026-11-24 AC6），
+ * 与 {@link isCurrentSession} / `live-merge.ts` 同口径，避免前缀形态差异导致漏过滤。
+ */
+function buildArchivedSet(ids: readonly string[]): Set<string> {
+  const out = new Set<string>()
+  for (const id of ids) {
+    if (typeof id !== 'string' || id === '') continue
+    const normalized = normalizeSessionId(id)
+    if (normalized !== '') out.add(normalized)
+  }
+  return out
+}
+
+function isArchivedSession(sessionId: string, archived: ReadonlySet<string>): boolean {
+  if (typeof sessionId !== 'string' || sessionId === '') return false
+  const normalized = normalizeSessionId(sessionId)
+  return normalized !== '' && archived.has(normalized)
+}
+
 export function observationsOf(source: TopZoneObservationSource): TopZoneObservation[] {
-  const archived = new Set(source.archivedSessionIds)
+  const archived = buildArchivedSet(source.archivedSessionIds)
   const counts = indexRunningSubagentDescendants(allSessionsOf(source))
   const observations: TopZoneObservation[] = []
   const seen = new Set<string>()
@@ -1655,7 +1675,7 @@ export function observationsOf(source: TopZoneObservationSource): TopZoneObserva
       // 与 `toSessionRow` 的 `running` 同式 ⇒ 「只有 subagent 在跑」也算运行中（D3a）。
       running: session.running === true || subagentCountOf(counts, session.sessionId) > 0,
       subagent: isSubagentSession(session),
-      archived: archived.has(session.sessionId),
+      archived: isArchivedSession(session.sessionId, archived),
     })
   }
   // ── N1/I3：归档会话**不在树里**（`buildProjects` 已剔除）⇒ 必须从独立通道补投影 ──
@@ -1994,7 +2014,7 @@ function isCurrentSession(sessionId: string, currentSessionId: unknown): boolean
 function isVisibleMember(session: SessionRowLike, context: EmitContext): boolean {
   return (
     !isSubagentSession(session) &&
-    !context.archived.has(session.sessionId) &&
+    !isArchivedSession(session.sessionId, context.archived) &&
     (!isBlank(session) || isCurrentSession(session.sessionId, context.currentSessionId))
   )
 }
@@ -2350,7 +2370,7 @@ export interface EffectiveOrder {
  */
 export function effectiveOrder(input: SidebarModelInput): EffectiveOrder {
   const context: EmitContext = {
-    archived: new Set(input.archivedSessionIds),
+    archived: buildArchivedSet(input.archivedSessionIds),
     collapsedKeys: input.collapsedKeys,
     expandedAllKeys: input.expandedAllKeys,
     expandLevels: input.expandLevels,
@@ -2583,7 +2603,7 @@ export function reorderManualScope(
  * @returns 渲染行序列；搜索无匹配时返回空数组（渲染层据此显示 `search.empty`）。
  */
 export function buildRows(input: SidebarModelInput): RenderRow[] {
-  const archived = new Set(input.archivedSessionIds)
+  const archived = buildArchivedSet(input.archivedSessionIds)
   const context: EmitContext = {
     archived,
     collapsedKeys: input.collapsedKeys,
@@ -2765,7 +2785,7 @@ export function buildRecentRows(input: SidebarModelInput): RenderRow[] {
   const query = (typeof input.query === 'string' ? input.query : '').trim()
   if (query !== '') return []
   const context: EmitContext = {
-    archived: new Set(input.archivedSessionIds),
+    archived: buildArchivedSet(input.archivedSessionIds),
     collapsedKeys: input.collapsedKeys,
     expandedAllKeys: input.expandedAllKeys,
     expandLevels: input.expandLevels,

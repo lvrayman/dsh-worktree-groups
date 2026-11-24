@@ -143,12 +143,77 @@ function liveEntriesOf(snapshot: unknown): Map<string, LiveEntry> {
 }
 
 /**
+ * 解析当前生效的归档会话 id 列表（2026-11-24 AC4）。
+ *
+ * - 当客户端 `useWorkspaces` 快照已就绪（`phase === 'ready'` 或省略 `phase`）且提供
+ *   `archivedSessionIds` 数组时，以该实时数组为准：归档与撤销归档均 0 ms 生效；
+ * - 快照处于 `pending`（首连未就绪）或缺席时，回退服务端树里的 `serverArchived`，
+ *   避免首连期间误把已归档会话闪现出来。
+ */
+export function resolveArchivedSessionIds(
+  serverArchived: readonly string[],
+  workspacesSnapshot: unknown,
+): string[] {
+  if (typeof workspacesSnapshot === 'object' && workspacesSnapshot !== null) {
+    const snap = workspacesSnapshot as { phase?: unknown; archivedSessionIds?: unknown }
+    if (Array.isArray(snap.archivedSessionIds) && (snap.phase === 'ready' || snap.phase === undefined)) {
+      return snap.archivedSessionIds.filter((id): id is string => typeof id === 'string' && id !== '')
+    }
+  }
+  return [...serverArchived]
+}
+
+/**
+ * 派生 `useWorkspaces` 快照的内容签名（2026-11-24 AC5），用于驱动防抖重取。
+ *
+ * 同时涵盖：
+ * - `items`（工作区增删、改名、路径或更新时间变化）；
+ * - `archivedSessionIds`（单会话归档 / 取消归档，按字典序归一化避免无意义抖动）；
+ * - `phase`（首连就绪迁移）。
+ */
+export function workspacesSnapshotSignature(workspacesSnapshot: unknown): string {
+  if (typeof workspacesSnapshot !== 'object' || workspacesSnapshot === null) return ''
+  const snap = workspacesSnapshot as {
+    phase?: unknown
+    items?: unknown
+    archivedSessionIds?: unknown
+  }
+  const itemsSig = Array.isArray(snap.items)
+    ? snap.items
+        .map((item) => {
+          const w = (typeof item === 'object' && item !== null ? item : {}) as {
+            workspaceId?: unknown
+            path?: unknown
+            title?: unknown
+            updatedAt?: unknown
+          }
+          return `${String(w.workspaceId ?? '')}:${String(w.path ?? '')}:${String(w.title ?? '')}:${String(w.updatedAt ?? '')}`
+        })
+        .join('|')
+    : ''
+  const archivedSig = Array.isArray(snap.archivedSessionIds)
+    ? snap.archivedSessionIds
+        .filter((id): id is string => typeof id === 'string' && id !== '')
+        .slice()
+        .sort()
+        .join(',')
+    : ''
+  const phaseSig = typeof snap.phase === 'string' ? snap.phase : ''
+  return `${phaseSig}#${itemsSig}#${archivedSig}`
+}
+
+/**
  * 把实时会话快照叠加到服务端树上（纯函数，不修改入参）。
  *
  * @param tree 最近一次服务端树；
- * @param snapshot `useSessions(identity)` 快照（缺席 / 形状不符 ⇒ 原样返回）。
+ * @param snapshot `useSessions(identity)` 快照（缺席 / 形状不符 ⇒ 原样返回）；
+ * @param liveArchivedSessionIds 可选实时归档集合（缺省使用 `tree.archivedSessionIds`）。
  */
-export function mergeLiveSessions<T extends LiveMergeTree>(tree: T, snapshot: unknown): LiveMergeResult<T> {
+export function mergeLiveSessions<T extends LiveMergeTree>(
+  tree: T,
+  snapshot: unknown,
+  liveArchivedSessionIds?: readonly string[],
+): LiveMergeResult<T> {
   const live = liveEntriesOf(snapshot)
   if (live.size === 0) return { tree, pendingIds: [] }
 
@@ -163,7 +228,7 @@ export function mergeLiveSessions<T extends LiveMergeTree>(tree: T, snapshot: un
     remember(project.flatSessions)
   }
   remember(tree.ungrouped)
-  const archived = new Set(tree.archivedSessionIds.map(bareId))
+  const archived = new Set((liveArchivedSessionIds ?? tree.archivedSessionIds).map(bareId))
 
   // 2) 新的顶层可见会话。
   const pendingIds: string[] = []

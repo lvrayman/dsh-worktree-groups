@@ -151,12 +151,14 @@ function serviceOf(ctx: Context, name: string): any {
  * @returns 桥接门面；服务缺席时对应方法静默 no-op / 抛明确错误。
  */
 function createBridge(ctx: Context): SidebarBridge {
-  /** 取 `uiWorkspace`（提供 startSession / openSession / forkSession / pickDirectory）。 */
+  /** 取 `uiWorkspace`（提供 startSession / openSession / forkSession / archiveSession / pickDirectory）。 */
   const uiWorkspace = (): any => serviceOf(ctx, 'uiWorkspace')
   /** 取 `workspaces`（提供 create / rename / delete / archiveSession）。 */
   const workspaces = (): any => serviceOf(ctx, 'workspaces')
   /** 取 `sessions`（提供 binding / fork / open）。 */
   const sessions = (): any => serviceOf(ctx, 'sessions')
+  /** 取 `contextMenus`（DSH 原生上下文菜单服务，承载 `target: 'session'` 的全部原生动作与插件扩展）。 */
+  const contextMenus = (): any => serviceOf(ctx, 'contextMenus')
 
   return {
     async pickDirectory() {
@@ -247,6 +249,11 @@ function createBridge(ctx: Context): SidebarBridge {
     },
 
     async archiveSession(sessionId) {
+      const workspace = uiWorkspace()
+      if (typeof workspace?.archiveSession === 'function') {
+        await workspace.archiveSession(sessionId)
+        return
+      }
       const service = workspaces()
       if (service === undefined) throw new Error('workspaces service is unavailable')
       await service.archiveSession(sessionId)
@@ -264,6 +271,20 @@ function createBridge(ctx: Context): SidebarBridge {
         if (service?.openSession !== undefined) service.openSession(childId)
         else sessions()?.open?.(childId)
       }
+    },
+
+    openSessionContextMenu(input) {
+      const menus = contextMenus()
+      if (typeof menus?.open !== 'function') return false
+      menus.open(
+        { kind: 'session', value: { sessionId: input.sessionId, displayTitle: input.displayTitle } },
+        { x: input.x, y: input.y },
+      )
+      return true
+    },
+
+    closeContextMenu() {
+      contextMenus()?.close?.()
     },
   }
 }

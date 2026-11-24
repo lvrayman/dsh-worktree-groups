@@ -2200,3 +2200,39 @@ test('2026-10-22/DR6 接线：commitDrag 三层都走 reorderManualScope（先�
     )
   }
 })
+
+test('2026-11-24/AC1-AC5 接线：侧栏接入原生会话右键菜单与实时 archivedSessionIds', () => {
+  const liveMergeImports = new Set()
+  walk(sidebar.sourceFile, (node) => {
+    if (!ts.isImportDeclaration(node)) return
+    const specifier = node.moduleSpecifier
+    if (!ts.isStringLiteral(specifier) || specifier.text !== './live-merge.js') return
+    const bindings = node.importClause?.namedBindings
+    if (bindings === undefined || !ts.isNamedImports(bindings)) return
+    for (const element of bindings.elements) liveMergeImports.add(element.name.text)
+  })
+  assert.ok(
+    liveMergeImports.has('resolveArchivedSessionIds'),
+    '★ sidebar.tsx 必须从 ./live-merge.js import resolveArchivedSessionIds',
+  )
+  assert.ok(
+    liveMergeImports.has('workspacesSnapshotSignature'),
+    '★ sidebar.tsx 必须从 ./live-merge.js import workspacesSnapshotSignature',
+  )
+  assert.ok(
+    callExpressionsOf(sidebar.sourceFile, 'resolveArchivedSessionIds').length >= 1,
+    '★ sidebar.tsx 必须调用 resolveArchivedSessionIds 计算实时归档集合',
+  )
+  assert.ok(
+    callExpressionsOf(sidebar.sourceFile, 'workspacesSnapshotSignature').length >= 1,
+    '★ sidebar.tsx 必须调用 workspacesSnapshotSignature 派生 workspacesSignature',
+  )
+  assert.ok(
+    callExpressionsOf(sidebar.sourceFile, 'openSessionContextMenu').length >= 1,
+    '★ sidebar.tsx 必须通过 actions.openSessionContextMenu 委托 DSH 原生会话右键菜单',
+  )
+  assert.ok(
+    callExpressionsOf(sidebar.sourceFile, 'closeContextMenu').length >= 1,
+    '★ sidebar.tsx 打开自绘 MenuLayer 前必须调用 actions.closeContextMenu 防止双菜单重叠',
+  )
+})

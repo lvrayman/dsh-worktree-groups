@@ -6,7 +6,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { mergeLiveSessions } from '../lib/live-merge.js'
+import {
+  mergeLiveSessions,
+  resolveArchivedSessionIds,
+  workspacesSnapshotSignature,
+} from '../lib/live-merge.js'
 
 function row(sessionId, overrides = {}) {
   return { sessionId, updatedAt: 100, lastActivityAt: 100, running: false, blank: false, ...overrides }
@@ -125,6 +129,69 @@ test('树里的 id 与快照 id 前缀形态不同（session- 前缀）也能对
   const tree = makeTree()
   tree.projects[0].worktrees[0].sessions = [row('abc', { cwd: '/repo', title: 'A' })]
   const merged = mergeLiveSessions(tree, snapshot([{ id: 'session-abc', cwd: '/repo', updatedAt: 100, running: false, blank: false, title: 'A' }]))
+  assert.equal(merged.tree, tree)
+  assert.deepEqual(merged.pendingIds, [])
+})
+
+test('2026-11-24/AC4 resolveArchivedSessionIds: 就绪态优先采用客户端实时归档集合，pending/缺席回退服务端', () => {
+  const server = ['session-old']
+  assert.deepEqual(
+    resolveArchivedSessionIds(server, { phase: 'ready', archivedSessionIds: ['session-old', 'session-new'] }),
+    ['session-old', 'session-new'],
+    'ready 态实时反映新增归档',
+  )
+  assert.deepEqual(
+    resolveArchivedSessionIds(server, { phase: 'ready', archivedSessionIds: [] }),
+    [],
+    'ready 态实时反映取消归档（清空）',
+  )
+  assert.deepEqual(
+    resolveArchivedSessionIds(server, { archivedSessionIds: ['session-a'] }),
+    ['session-a'],
+    '省略 phase 的最小快照也采用实时集合',
+  )
+  assert.deepEqual(
+    resolveArchivedSessionIds(server, { phase: 'pending', archivedSessionIds: [] }),
+    server,
+    'pending 态不得用空数组覆盖服务端归档集合',
+  )
+  assert.deepEqual(resolveArchivedSessionIds(server, undefined), server, '快照缺席回退服务端')
+})
+
+test('2026-11-24/AC5 workspacesSnapshotSignature: 归档集合增删也会改变签名（触发 reload）', () => {
+  const base = {
+    phase: 'ready',
+    items: [{ workspaceId: 'w1', path: '/repo', title: 'Repo', updatedAt: 100 }],
+    archivedSessionIds: ['session-1'],
+  }
+  const archivedMore = { ...base, archivedSessionIds: ['session-1', 'session-2'] }
+  const reorderedSame = { ...base, archivedSessionIds: ['session-2', 'session-1'] }
+  const unarchived = { ...base, archivedSessionIds: [] }
+
+  assert.notEqual(
+    workspacesSnapshotSignature(base),
+    workspacesSnapshotSignature(archivedMore),
+    '新增归档会话必须改变签名',
+  )
+  assert.notEqual(
+    workspacesSnapshotSignature(base),
+    workspacesSnapshotSignature(unarchived),
+    '取消归档会话必须改变签名',
+  )
+  assert.equal(
+    workspacesSnapshotSignature(archivedMore),
+    workspacesSnapshotSignature(reorderedSame),
+    '仅归档数组顺序变化不应误触发重取',
+  )
+})
+
+test('2026-11-24/AC4 mergeLiveSessions: 传入实时 liveArchivedSessionIds 时，刚归档的实时会话不进 pendingIds', () => {
+  const tree = makeTree()
+  const merged = mergeLiveSessions(
+    tree,
+    snapshot([{ id: 'session-just-archived', cwd: '/repo', updatedAt: 200, running: false, blank: false }]),
+    ['session-archived', 'session-just-archived'],
+  )
   assert.equal(merged.tree, tree)
   assert.deepEqual(merged.pendingIds, [])
 })

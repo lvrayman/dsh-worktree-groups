@@ -6657,3 +6657,54 @@ test('2026-10-22/DR6 真实场景：新增工作区不在 manual.projects 里 �
     '★ 渲染顺序跟随新的手动顺序',
   )
 })
+
+test('2026-11-24/AC6 archivedSessionIds 与 sessionId 的 session- 前缀不一致时仍过滤（树 / 未分组 / 最近 / observationsOf）', () => {
+  const modelInput = input({
+    projects: [
+      project({
+        key: '/repo/.git',
+        title: 'Repo',
+        worktrees: [
+          worktree('/repo', {
+            branch: 'main',
+            isMain: true,
+            sessions: [
+              session('session-keep', { updatedAt: 300 }),
+              session('session-arch1', { updatedAt: 400 }),
+              session('arch2', { updatedAt: 500 }),
+            ],
+          }),
+        ],
+      }),
+    ],
+    ungrouped: [
+      session('session-u-arch', { updatedAt: 600 }),
+      session('session-u-keep', { updatedAt: 200 }),
+    ],
+    // 刻意与上面的 sessionId 错开 session- 前缀形态
+    archivedSessionIds: ['arch1', 'session-arch2', 'u-arch'],
+    includeRecent: true,
+  })
+
+  const rows = buildRows(modelInput)
+  const visibleSessionIds = rows.filter((r) => r.kind === 'session').map((r) => r.sessionId)
+  assert.deepEqual(
+    visibleSessionIds,
+    ['session-keep', 'session-u-keep', 'session-keep', 'session-u-keep'],
+    'worktree、未分组与最近分区都必须过滤掉前缀形态不同的归档会话',
+  )
+
+  const order = effectiveOrder(modelInput)
+  assert.deepEqual(order.sessions.get('w:/repo'), ['session-keep'])
+
+  const obs = observationsOf({
+    projects: modelInput.projects,
+    ungrouped: modelInput.ungrouped,
+    archivedSessionIds: modelInput.archivedSessionIds,
+  })
+  const byId = new Map(obs.map((o) => [o.sessionId, o]))
+  assert.equal(byId.get('session-arch1')?.archived, true, 'observationsOf 必须识别前缀不同的归档会话')
+  assert.equal(byId.get('arch2')?.archived, true)
+  assert.equal(byId.get('session-u-arch')?.archived, true)
+  assert.equal(byId.get('session-keep')?.archived, false)
+})

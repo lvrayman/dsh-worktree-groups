@@ -59,7 +59,11 @@ import {
   type SidebarModelInput,
   type TopZoneState,
 } from './tree-model.js'
-import { mergeLiveSessions } from './live-merge.js'
+import {
+  mergeLiveSessions,
+  resolveArchivedSessionIds,
+  workspacesSnapshotSignature,
+} from './live-merge.js'
 import { sessionRowPropsEqual, type RowDragState } from './row-memo.js'
 
 /** primitives 无可用类型声明（esbuild external），按契约 §2.5 收窄。 */
@@ -210,6 +214,13 @@ export interface SidebarBridge {
   renameSession(sessionId: string, title: string): Promise<void>
   archiveSession(sessionId: string): Promise<void>
   forkSession(sessionId: string): Promise<void>
+  /**
+   * 打开 DSH 原生会话上下文菜单（`ctx.contextMenus.open({ kind: 'session', ... }, point)`）。
+   * 返回 `true` 表示已交由宿主原生菜单接管；`false` 表示宿主无 `contextMenus` 服务，需降级自绘。
+   */
+  openSessionContextMenu?(input: { sessionId: string; displayTitle: string; x: number; y: number }): boolean
+  /** 关闭已打开的 DSH 原生上下文菜单（右键切到项目/worktree 自绘菜单时防止双菜单重叠）。 */
+  closeContextMenu?(): void
 }
 
 /**
@@ -983,6 +994,8 @@ interface Actions {
   renameSession(sessionId: string, title: string): Promise<void>
   archiveSession(sessionId: string): Promise<void>
   forkSession(sessionId: string): Promise<void>
+  openSessionContextMenu(input: { sessionId: string; displayTitle: string; x: number; y: number }): boolean
+  closeContextMenu(): void
   renameWorkspace(workspaceId: string, title: string): Promise<void>
   /**
    * 目录选择阶段（D19 / 2026-10-21 Fix4）：返回路径，`null` = 用户取消。
@@ -1278,6 +1291,7 @@ function SessionRowViewInner(props: SessionRowProps): ReactNode {
 
   return jsx('div', {
     role: 'treeitem',
+    tabIndex: 0,
     'aria-current': row.isCurrent ? 'true' : undefined,
     ...(row.isCurrent ? { 'data-selected': 'true' } : {}),
     'data-session-id': row.sessionId,
@@ -1291,11 +1305,30 @@ function SessionRowViewInner(props: SessionRowProps): ReactNode {
     onMouseLeave: () => { setHovered(false) },
     onClick: () => { live()?.onOpen() },
     onContextMenu: (event: Any) => {
+      // 2026-11-24 AC2：空白占位会话没有可归档/重命名/派生的内容，与 DSH 原生 SessionNodeItem 一致不拦截。
+      if (row.blank === true) return
       event.preventDefault()
       event.stopPropagation()
+      const rawX = Number(event.clientX) || 0
+      const rawY = Number(event.clientY) || 0
+      const rect = rawX === 0 && rawY === 0 ? event.currentTarget?.getBoundingClientRect?.() : undefined
       live()?.onMenu({
-        x: Math.round(Number(event.clientX) || 0),
-        y: Math.round(Number(event.clientY) || 0),
+        x: Math.round(rect?.left ?? rawX),
+        y: Math.round(rect?.bottom ?? rawY),
+        title: row.label,
+        sessionId: row.sessionId,
+      })
+    },
+    onKeyDown: (event: Any) => {
+      if (row.blank === true) return
+      if (event.defaultPrevented || event.repeat || event.nativeEvent?.isComposing || event.ctrlKey || event.altKey || event.metaKey) return
+      if (!(event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey))) return
+      event.preventDefault()
+      event.stopPropagation()
+      const rect = event.currentTarget?.getBoundingClientRect?.()
+      live()?.onMenu({
+        x: Math.round(rect?.left ?? 0),
+        y: Math.round(rect?.bottom ?? 0),
         title: row.label,
         sessionId: row.sessionId,
       })
@@ -2082,18 +2115,16 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   const sources = sourcesRef.current
 
   const sessionsSnapshot = sources.sessions(identity) as SessionsSnapshot | undefined
-  // 订阅工作区快照：树数据本身走 HTTP，这里派生签名以驱动防抖重取（含 dsh remote 切换远端工作区基线到达）。
+  // 订阅工作区快照：树数据本身走 HTTP，这里派生签名以驱动防抖重取（含 dsh remote 切换远端工作区基线到达，
+  // 以及单会话归档 / 取消归档导致的 archivedSessionIds 变更）。
   const workspacesSnapshot = sources.workspaces(identity) as
-    | { items?: ReadonlyArray<{ workspaceId?: unknown; path?: unknown; title?: unknown; updatedAt?: unknown }> }
+    | {
+        phase?: unknown
+        items?: ReadonlyArray<{ workspaceId?: unknown; path?: unknown; title?: unknown; updatedAt?: unknown }>
+        archivedSessionIds?: ReadonlyArray<unknown>
+      }
     | undefined
-  const workspacesSignature = Array.isArray(workspacesSnapshot?.items)
-    ? workspacesSnapshot.items
-        .map(
-          (w) =>
-            `${String(w?.workspaceId ?? '')}:${String(w?.path ?? '')}:${String(w?.title ?? '')}:${String(w?.updatedAt ?? '')}`,
-        )
-        .join('|')
-    : ''
+  const workspacesSignature = workspacesSnapshotSignature(workspacesSnapshot)
   // D2：两个 live-fact 快照的**返回值必须真正读出来** —— 只调用不接收会让订阅变死代码。
   // 无条件订阅（hook 调用顺序恒定），取值只在渲染会话行时用（见 `withLiveState`）。
   const sessionStatus = sources.status(identity)
@@ -2141,6 +2172,15 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   // ── 树数据 / 弹窗状态 ───────────────────────────────────────────────
   const [serverTree, setTree] = useState<TreeResponse | null>(null)
   /**
+   * 2026-11-24 AC4：客户端实时归档集合。
+   * `useWorkspaces` 就绪后直接跟宿主 `archivedSessionIds` 同步（归档 / 撤销归档 0 ms 生效），
+   * 首连 `pending` 或缺席时回退服务端树里的 `archivedSessionIds`。
+   */
+  const liveArchivedSessionIds = useMemo<string[]>(
+    () => resolveArchivedSessionIds(serverTree?.archivedSessionIds ?? [], workspacesSnapshot),
+    [serverTree, workspacesSnapshot],
+  )
+  /**
    * **PERF6（2026-11-14）**：服务端树 + 宿主实时会话快照的叠加结果。
    *
    * 新建会话、改标题、运行态变化**立即**体现在侧栏，不必等 `/tree` 往返；`pendingIds`
@@ -2148,8 +2188,8 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
    * （即叠加后的树）；无变化时 `mergeLiveSessions` 返回同一引用，下游 memo 全部短路。
    */
   const merged = useMemo(
-    () => (serverTree === null ? null : mergeLiveSessions(serverTree, sessionsSnapshot)),
-    [serverTree, sessionsSnapshot],
+    () => (serverTree === null ? null : mergeLiveSessions(serverTree, sessionsSnapshot, liveArchivedSessionIds)),
+    [serverTree, sessionsSnapshot, liveArchivedSessionIds],
   )
   const tree: TreeResponse | null = merged === null ? null : merged.tree
   const pendingLiveSignature = merged === null ? '' : merged.pendingIds.join(',')
@@ -2309,6 +2349,16 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
       const fork = readFunction(props, 'forkSession')
       if (fork !== undefined) { await fork(sessionId); return }
       await bridge?.forkSession(sessionId)
+    },
+    openSessionContextMenu: (input) => {
+      const openNative = readFunction(props, 'openSessionContextMenu')
+      if (openNative !== undefined) return openNative(input) === true
+      return bridge?.openSessionContextMenu?.(input) === true
+    },
+    closeContextMenu: () => {
+      const closeNative = readFunction(props, 'closeContextMenu')
+      if (closeNative !== undefined) { closeNative(); return }
+      bridge?.closeContextMenu?.()
     },
     renameWorkspace: async (workspaceId, title) => {
       const rename = readFunction(props, 'renameWorkspace')
@@ -2473,12 +2523,12 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
         observationsOf({
           projects: tree.projects,
           ungrouped: tree.ungrouped,
-          archivedSessionIds: tree.archivedSessionIds,
+          archivedSessionIds: liveArchivedSessionIds,
         }),
         Date.now(),
       ),
     )
-  }, [tree])
+  }, [tree, liveArchivedSessionIds])
 
   /** 渲染期顶部区输入（纯运行时；`effectiveOrder` 永不消费它）。 */
   const topZone = useMemo(() => topZoneInputOf(topZoneState), [topZoneState])
@@ -2507,7 +2557,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   const treeInput = useMemo<SidebarModelInput>(() => ({
     projects: tree?.projects ?? [],
     ungrouped: tree?.ungrouped ?? [],
-    archivedSessionIds: tree?.archivedSessionIds ?? [],
+    archivedSessionIds: liveArchivedSessionIds,
     collapsedKeys,
     expandedAllKeys: {},
     expandLevels,
@@ -2519,7 +2569,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
     includeRecent: true,
     archivedProjectKeys,
     ...(currentSessionId === undefined ? {} : { currentSessionId }),
-  }), [tree, collapsedKeys, expandLevels, query, t, manualOrder, topZone, archivedProjectKeys, currentSessionId])
+  }), [tree, liveArchivedSessionIds, collapsedKeys, expandLevels, query, t, manualOrder, topZone, archivedProjectKeys, currentSessionId])
 
   const view = useMemo<TreeView>(
     () => buildTreeView(tree, treeInput),
@@ -2583,7 +2633,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
     const defaults = effectiveOrder({
       projects: tree.projects,
       ungrouped: tree.ungrouped,
-      archivedSessionIds: tree.archivedSessionIds,
+      archivedSessionIds: liveArchivedSessionIds,
       collapsedKeys: {},
       expandedAllKeys: {},
       query: '',
@@ -2607,7 +2657,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
     // 只写 `localStorage` + state；不复用 `commitDrag`（那会把「拖拽」的语义混进来）。
     setManualOrder(plan.order)
     writeManualOrder(plan.order)
-  }, [topZoneState.newSessionIds, topZoneState.writtenNewSessionIds, manualOrder, tree, t])
+  }, [topZoneState.newSessionIds, topZoneState.writtenNewSessionIds, manualOrder, tree, liveArchivedSessionIds, t])
 
   // ── 拖拽排序（D10）──────────────────────────────────────────────────
   /** 写手动顺序：同时更新 state（立即重排）与 `localStorage`（跨刷新保持）。 */
@@ -2831,7 +2881,10 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
   }
 
   // ── 菜单动作的分发入口（放在这里，供 MenuLayer 与行内按钮共用） ─────
-  const openMenu = (target: MenuTarget): void => { setMenuTarget(target) }
+  const openMenu = (target: MenuTarget): void => {
+    actions.closeContextMenu()
+    setMenuTarget(target)
+  }
 
   /** 鼠标坐标 → 菜单锚点；按钮触发时用元素 rect，右键时用事件坐标。 */
   const pointOf = (event: Any, fallback: Any): { x: number; y: number } => {
@@ -2883,6 +2936,17 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
           actions.openSession(row.sessionId)
         },
         onMenu: (target: { x: number; y: number; title: string; sessionId: string }) => {
+          // 2026-11-24 AC1：优先交给 DSH 原生会话上下文菜单（置顶/重命名/派生/复制ID/归档及插件扩展）；
+          // 宿主缺少 `contextMenus` 服务时才降级到本插件自绘 `MenuLayer`。
+          if (actions.openSessionContextMenu({
+            sessionId: target.sessionId,
+            displayTitle: target.title,
+            x: target.x,
+            y: target.y,
+          })) {
+            setMenuTarget(null)
+            return
+          }
           openMenu({ kind: 'session', x: target.x, y: target.y, title: target.title, sessionId: target.sessionId })
         },
         ...(rowDrag === undefined ? {} : { drag: rowDrag }),

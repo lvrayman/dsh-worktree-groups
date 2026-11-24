@@ -36,8 +36,8 @@ test('PERF5: reload 不再「先 abort 在途请求再重发」，而是单在�
   assert.match(body, /visibilityState === 'hidden'/, 'PERF7：页面隐藏时跳过')
 })
 
-test('PERF6: 下游树 = mergeLiveSessions(serverTree, sessionsSnapshot)；防抖不再依赖整份 sessionsSnapshot', () => {
-  assert.match(source, /mergeLiveSessions\(serverTree, sessionsSnapshot\)/)
+test('PERF6: 下游树 = mergeLiveSessions(serverTree, sessionsSnapshot, ...)；防抖不再依赖整份 sessionsSnapshot', () => {
+  assert.match(source, /mergeLiveSessions\(serverTree, sessionsSnapshot(?:, [^)]+)?\)/)
   const effect = source.slice(source.indexOf('setTimeout(reload, RELOAD_DEBOUNCE_MS)'))
   const deps = effect.slice(effect.indexOf('}, ['), effect.indexOf(']', effect.indexOf('}, [')) + 1)
   assert.equal(deps.includes('sessionsSnapshot'), false, `防抖依赖不得含 sessionsSnapshot：${deps}`)
