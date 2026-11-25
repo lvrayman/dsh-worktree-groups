@@ -2236,3 +2236,68 @@ test('2026-11-24/AC1-AC5 接线：侧栏接入原生会话右键菜单与实时 
     '★ sidebar.tsx 打开自绘 MenuLayer 前必须调用 actions.closeContextMenu 防止双菜单重叠',
   )
 })
+
+test('2026-11-25/AC1-AC2 接线：MenuLayer 向 P.Menu 传入 CSS 锚定 anchorPoint 并保留旧版 getAnchorRect', () => {
+  let menuLayerFn = null
+  walk(sidebar.sourceFile, (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'MenuLayer') {
+      menuLayerFn = node
+    }
+  })
+  assert.ok(menuLayerFn !== null, '★ sidebar.tsx 必须声明 MenuLayer 函数')
+
+  const menuCalls = []
+  walk(menuLayerFn, (node) => {
+    if (!ts.isCallExpression(node)) return
+    const callee = node.expression.getText(sidebar.sourceFile)
+    if (callee !== 'jsx' && callee !== 'jsxs') return
+    if (node.arguments.length < 2) return
+    if (normalizeWs(node.arguments[0].getText(sidebar.sourceFile)) !== 'P.Menu') return
+    menuCalls.push(node)
+  })
+  assert.equal(menuCalls.length, 1, '★ MenuLayer 必须恰好有一处 jsx(P.Menu, ...) 调用')
+
+  const propsArg = menuCalls[0].arguments[1]
+  assert.ok(ts.isObjectLiteralExpression(propsArg), '★ P.Menu 的第二个实参必须是 props 对象字面量')
+
+  const propsByName = new Map()
+  for (const prop of propsArg.properties) {
+    if (ts.isPropertyAssignment(prop)) {
+      propsByName.set(prop.name.getText(sidebar.sourceFile), normalizeWs(prop.initializer.getText(sidebar.sourceFile)))
+    } else if (ts.isShorthandPropertyAssignment(prop)) {
+      propsByName.set(prop.name.text, prop.name.text)
+    }
+  }
+
+  assert.equal(propsByName.get('open'), 'true', '★ MenuLayer 渲染 P.Menu 必须传 open: true')
+  assert.equal(propsByName.get('portal'), 'true', '★ MenuLayer 渲染 P.Menu 必须传 portal: true')
+  assert.equal(propsByName.get('anchor'), 'null', '★ DSH v0.2.2+ CSS 锚定菜单应传 anchor: null（与宿主 MenuOverlay 对齐）')
+  assert.ok(
+    propsByName.has('anchorPoint'),
+    '★ DSH v0.2.2+ 移除了 getAnchorRect，MenuLayer 必须向 P.Menu 传入 anchorPoint ({ x, y })',
+  )
+  assert.ok(
+    propsByName.has('getAnchorRect'),
+    '★ 需保留 getAnchorRect 以向后兼容 DSH < 0.2.2 宿主',
+  )
+
+  // 验证 anchorPoint 通过 useMemo 基于 anchorX / anchorY 稳定构造
+  let anchorPointInit = null
+  walk(menuLayerFn, (node) => {
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === propsByName.get('anchorPoint')
+      && node.initializer !== undefined
+    ) {
+      anchorPointInit = normalizeWs(node.initializer.getText(sidebar.sourceFile))
+    }
+  })
+  assert.ok(anchorPointInit !== null, '★ anchorPoint 必须作为稳定局部绑定传给 P.Menu')
+  assert.match(
+    anchorPointInit,
+    /^useMemo\(\s*\(\)\s*=>\s*\(\{\s*x:\s*anchorX,\s*y:\s*anchorY\s*\}\)\s*,\s*\[\s*anchorX,\s*anchorY\s*\]\s*\)$/,
+    `★ anchorPoint 必须通过 useMemo(() => ({ x: anchorX, y: anchorY }), [anchorX, anchorY]) 构造，实际：${anchorPointInit}`,
+  )
+})
+

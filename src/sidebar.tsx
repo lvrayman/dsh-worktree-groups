@@ -3414,12 +3414,13 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
 /**
  * 菜单层：worktree 菜单（D14）与项目 / 会话菜单共用同一个 `Menu`。
  *
- * 两个坑（`docs/HOST-CONTRACTS.md` §B5.2）：
- * 1. `Menu.anchor` 会被包在 `<span>` 里 ⇒ 传一个 0×0 的行内锚点，不抢布局；
- *    菜单本体用 `portal: true` + `getAnchorRect` 定位到鼠标坐标。
- * 2. `getAnchorRect` **只在 portal 模式生效**，且它在 `Menu` 的 `useLayoutEffect`
- *    依赖数组里 ⇒ 必须用 `useCallback` 稳定引用，否则每次渲染都 `setFixedPos`
- *    一个新对象，形成"渲染→定位→渲染"死循环。
+ * 宿主演进与兼容要点（`docs/HOST-CONTRACTS.md` §B5.2）：
+ * 1. DSH `v0.2.2-alpha.2`（`css-anchored-menus`）移除了 `Menu.getAnchorRect`，改为 CSS Anchor
+ *    Positioning：按坐标触发的 portal 菜单须传 `anchor: null` + `anchorPoint: { x, y }`
+ *    （客户端视口坐标，同 `event.clientX`/`clientY` 与 `getBoundingClientRect()`；Safari 偏移由
+ *    `Menu` 内部处理，调用方不可重复叠加）。
+ * 2. 同时保留经 `useCallback` 稳定的 `getAnchorRect`，以兼容 DSH `< 0.2.2` 旧宿主（新旧宿主
+ *    `Menu` 均按具名解构 props，无 `...rest` 透传到 DOM）。
  */
 function MenuLayer(props: {
   target: MenuTarget | null
@@ -3442,6 +3443,7 @@ function MenuLayer(props: {
   const t = props.t
   const anchorX = target?.x ?? 0
   const anchorY = target?.y ?? 0
+  const anchorPoint = useMemo(() => ({ x: anchorX, y: anchorY }), [anchorX, anchorY])
   const getAnchorRect = useCallback(
     () => ({ left: anchorX, top: anchorY, right: anchorX, bottom: anchorY, width: 0, height: 0 }),
     [anchorX, anchorY],
@@ -3588,7 +3590,8 @@ function MenuLayer(props: {
   return jsx(P.Menu, {
     open: true,
     portal: true,
-    anchor: jsx('span', { style: { display: 'inline-block', width: 0, height: 0 } }),
+    anchor: null,
+    anchorPoint,
     getAnchorRect,
     items,
     onClose: props.onClose,

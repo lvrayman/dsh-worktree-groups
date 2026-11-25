@@ -1051,6 +1051,8 @@ JSDoc（`:1703-1740`，节选）：
 - `getAnchorRect` — 仅 portal 模式；从宿主自有触发按钮提供 rect（**render-prop anchor / 效果定位代理处测量会与宿主 layout effect 竞争**）
 - `selection` — `'check'`（默认，尾部勾）或 `'fill'`（无勾，保持 hover 填充）
 
+> **2026-11-25 宿主演进核实（DSH `0.2.2-rc.5` / `v0.2.2-alpha.2` `css-anchored-menus`）**：`@deepseek-ai/dsh-client-ui-primitives` 移除了 `useAnchoredPosition` 与 `Menu.getAnchorRect`，改为 CSS Anchor Positioning（`anchorRef` 指向触发元素 ref，或 `anchorPoint: { x, y }` 用于按客户端视口坐标打开 portal 菜单，配合 `anchor={null}`）。`Menu` 新旧版本均为具名解构（不向 DOM 透传未知 prop），本插件 `MenuLayer` 同时传 `anchorPoint` 与 `getAnchorRect` 以兼容新旧宿主。详见 [2026-11-25 工作记录](worklog/2026-11-25-menu-anchor-point-fix.md)。
+
 **`items` 条目形状**（从 `isSeparator`/`isLabel` + 渲染逻辑 `:1830-1900` 反推）：
 
 ```ts
