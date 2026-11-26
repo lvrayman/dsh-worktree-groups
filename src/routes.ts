@@ -25,12 +25,12 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { lstat, readdir, realpath, stat } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-import { normalizePath, runGit, scanRepo } from './git.js'
+import { listRepoBranches, normalizePath, runGit, scanRepo } from './git.js'
 import { attachLastActivityTimes, registerSessionActivityObserver, sessionActivityVersion } from './activity.js'
 import { createFileLedger } from './ledger.js'
 import { buildProjects, collectUngrouped } from './projects.js'
@@ -44,6 +44,7 @@ const ROUTE_PREFIX = '/dsh-worktree-groups'
 /** 本插件注册的全部路由路径（导出便于测试与客户端对齐）。 */
 export const ROUTE_PATHS = {
   tree: `${ROUTE_PREFIX}/tree`,
+  worktreeBranches: `${ROUTE_PREFIX}/worktree-branches`,
   worktreeCreate: `${ROUTE_PREFIX}/worktree-create`,
   worktreeRemove: `${ROUTE_PREFIX}/worktree-remove`,
   reveal: `${ROUTE_PREFIX}/reveal`,
@@ -1105,7 +1106,7 @@ function withRemoteTimeoutSignal(signal: AbortSignal | undefined, timeoutMs = RE
  */
 async function tryCallRemotePluginRoute(
   ctx: Context,
-  endpoint: 'tree' | 'worktree-create' | 'worktree-remove' | 'reveal' | 'workspace-open',
+  endpoint: 'tree' | 'worktree-branches' | 'worktree-create' | 'worktree-remove' | 'reveal' | 'workspace-open',
   payload: Record<string, unknown>,
   signal?: AbortSignal,
   now = Date.now(),
@@ -1838,6 +1839,9 @@ async function dispatchLocalWorktreePluginCall(
       }
       const payload = await buildTreePayload(ctx, { ...localOpts, reuseSessions: true })
       return { status: 200, payload: payload as unknown as Record<string, unknown> }
+    }
+    if (endpoint === 'worktree-branches') {
+      return await collectResponse((res) => handleWorktreeBranches(ctx, res, body, localOpts))
     }
     if (endpoint === 'worktree-create') {
       return await collectResponse((res) => handleWorktreeCreate(ctx, res, body, localOpts))
@@ -2720,59 +2724,47 @@ export function defaultWorktreePath(mainPath: string, branch: string): string {
  * @returns 归一化后的路径，或拒绝原因。
  */
 export function validateTargetPath(raw: string, mainPath: string, parentReal?: string): PathVerdict {
-  const main = normalizePath(mainPath)
-  const parent = dirname(main)
-  const target = normalizePath(raw)
+  const trimmed = raw.trim()
   const label = 'targetPath'
+  if (trimmed === '') {
+    return { ok: false, message: `${label} 不能为空` }
+  }
+  if (!isAbsolute(trimmed)) {
+    return { ok: false, message: `${label} 必须是绝对路径：${trimmed}` }
+  }
 
-  // **D-N2**：调用方解析过符号链接时（`parentReal` 给的是**真身**父目录），判据必须落在
-  // realpath 空间 —— 词法比较挡不住「父目录是指向仓外的符号链接」：攻击者在主仓父目录下
-  // 建一个 `demo-repo-evil-link -> /仓外目录`，词法上完全合法（同父目录 + 主仓名前缀）
-  // ⇒ 校验通过 ⇒ git 把整个 worktree 铺到链接真身，D-5 被绕过。
-  //
-  // 目标也归一到**真身拼法**（父目录取真身、叶子名原样保留），因此返回的 `path` 可直接
-  // 交给 git，且与 `git worktree list` 回的 realpath 拼法一致（回填更稳）。
-  const effectiveParent = parentReal === undefined ? parent : normalizePath(parentReal)
+  const main = normalizePath(mainPath)
+  const target = normalizePath(trimmed)
   const effectiveTarget =
-    parentReal === undefined ? target : join(effectiveParent, basename(target))
+    parentReal === undefined ? target : join(normalizePath(parentReal), basename(target))
 
   if (effectiveTarget === main) {
     return { ok: false, message: `${label} 不能等于主仓路径：${effectiveTarget}` }
   }
-  if (dirname(effectiveTarget) !== effectiveParent) {
-    return {
-      ok: false,
-      message: `${label} 必须是主仓父目录的直接子目录（${effectiveParent}），拒绝：${effectiveTarget}`,
-    }
+  if (
+    effectiveTarget === `${main}/.git` ||
+    effectiveTarget.startsWith(`${main}/.git/`) ||
+    effectiveTarget.split('/').includes('.git')
+  ) {
+    return { ok: false, message: `${label} 不能落入 .git 目录内：${effectiveTarget}` }
   }
   const name = basename(effectiveTarget)
   if (name === '' || name.startsWith('.')) {
     return { ok: false, message: `${label} 的目录名非法（不得为空或以 . 开头）：${effectiveTarget}` }
   }
-  if (!name.startsWith(basename(main))) {
-    return {
-      ok: false,
-      message: `${label} 的目录名必须以主仓名开头（${basename(main)}），拒绝：${effectiveTarget}`,
-    }
-  }
   return { ok: true, path: effectiveTarget }
 }
 
 /**
- * **D-N2**：解析「`targetPath` 的父目录」与「主仓路径」的**真实路径**（`realpath`），
+ * 解析「`targetPath` 的父目录」与「主仓路径」的真实路径（`realpath`），
  * 供 {@link validateTargetPath} 的第三参做符号链接安全的比较。
  *
- * 为什么解析**父目录**而不是目标本身：目标目录**还不存在**，`realpath(target)` 必然 ENOENT。
- *
- * 全部失败路径都返回 `{ ok: false }`，**绝不**退化成放行：
- *  - 目标路径本身已存在且是**符号链接** ⇒ 拒绝（必须用 `lstat`：`stat` 会跟随链接，
- *    看不出它是链接）；
- *  - 目标父目录不存在 / 无权限 / `realpath` 抛错 ⇒ 拒绝；
- *  - 主仓父目录 `realpath` 失败 ⇒ 拒绝；
- *  - 解析后两个**真实**父目录不相等（父目录是符号链接，或路径中某一级指向别处）⇒ 拒绝。
- *
- * 通过时返回真身空间的 `mainPathReal` / `parentReal`：前者保证「等于主仓自身」这条判据
- * 也在 realpath 空间成立，后者就是允许落点。
+ * 2026-11-26 IDEA 风格修订：允许用户自定义 Location（父目录）与 Project name，
+ * 但严格保留安全底线：
+ *  - 目标路径必须为非空绝对路径；
+ *  - 目标路径本身不得已存在（特别是符号链接，用 `lstat` 捕获悬空与真实链接）；
+ *  - 目标父目录必须存在、可解析且为真实目录；
+ *  - 主仓路径同步解析到 realpath 空间，确保「不得等于主仓」「不得落入 .git」在真身空间成立。
  */
 async function resolveRealTargetParents(
   rawTarget: string,
@@ -2780,23 +2772,32 @@ async function resolveRealTargetParents(
 ): Promise<
   { ok: true; mainPathReal: string; parentReal: string } | { ok: false; message: string }
 > {
-  const target = normalizePath(rawTarget)
+  const trimmed = rawTarget.trim()
+  if (trimmed === '' || !isAbsolute(trimmed)) {
+    return { ok: false, message: `targetPath 必须是非空绝对路径：${rawTarget}` }
+  }
+  const target = normalizePath(trimmed)
   const targetParent = dirname(target)
 
-  // (1) 目标本身已存在且是符号链接 ⇒ 拒绝（`lstat`；`stat` 会跟随链接而看不出）。
+  // (1) 目标本身已存在（含符号链接 / 悬空链接）⇒ 拒绝（`lstat`；`stat` 会跟随链接而看不出）。
   try {
     const info = await lstat(target)
     if (info.isSymbolicLink()) {
       return { ok: false, message: `targetPath 已存在且是符号链接，拒绝：${target}` }
     }
+    return { ok: false, message: `targetPath 已存在，拒绝：${target}` }
   } catch {
     // ENOENT：目标还不存在 —— 这是唯一合法的常态，继续校验它的父目录。
   }
 
-  // (2) 父目录必须存在且可解析；`realpath` 抛错（ENOENT / 权限）⇒ 拒绝。
+  // (2) 父目录必须存在、可解析且为目录；`realpath` 抛错（ENOENT / 权限）⇒ 拒绝。
   let targetParentReal: string
   try {
     targetParentReal = await realpath(targetParent)
+    const parentInfo = await stat(targetParentReal)
+    if (!parentInfo.isDirectory()) {
+      return { ok: false, message: `targetPath 的父路径不是目录，拒绝：${targetParent}` }
+    }
   } catch (error) {
     return {
       ok: false,
@@ -2804,30 +2805,19 @@ async function resolveRealTargetParents(
     }
   }
 
-  // (3) 主仓父目录同理；它就是「允许落点」的真身基准。
+  // (3) 主仓路径也解析到 realpath 空间，确保与 target 在同一空间比较。
   const main = normalizePath(mainPath)
-  const mainParent = dirname(main)
-  let mainParentReal: string
+  let mainPathReal: string
   try {
-    mainParentReal = await realpath(mainParent)
+    mainPathReal = normalizePath(await realpath(main))
   } catch (error) {
     return {
       ok: false,
-      message: `主仓父目录不可解析，拒绝：${mainParent}（${failMessage(error)}）`,
+      message: `主仓路径不可解析，拒绝：${main}（${failMessage(error)}）`,
     }
   }
 
-  // (4) 两边都解析到真身后再比较 —— 这一步才是挡住符号链接的地方。
-  const parentReal = normalizePath(targetParentReal)
-  const resolvedMainParent = normalizePath(mainParentReal)
-  if (parentReal !== resolvedMainParent) {
-    return {
-      ok: false,
-      message: `targetPath 的父目录经符号链接解析后不是主仓父目录（${resolvedMainParent}），拒绝：${target}`,
-    }
-  }
-
-  return { ok: true, mainPathReal: join(parentReal, basename(main)), parentReal }
+  return { ok: true, mainPathReal, parentReal: normalizePath(targetParentReal) }
 }
 
 /**
@@ -3082,6 +3072,11 @@ export function registerRoutes(ctx: Context): void {
     }
   })
 
+  register(ROUTE_PATHS.worktreeBranches, 'worktree-branches', async (req, res) => {
+    const body = await readBody(req)
+    await handleWorktreeBranches(ctx, res, body)
+  })
+
   register(ROUTE_PATHS.worktreeCreate, 'worktree-create', async (req, res) => {
     const body = await readBody(req)
     await handleWorktreeCreate(ctx, res, body)
@@ -3131,6 +3126,50 @@ export function registerRoutes(ctx: Context): void {
     }
     json(res, 200, { ok: true, workspaceId })
   })
+}
+
+/** `POST /worktree-branches` 的处理器：返回已知 git 仓的全量分支与 worktree 占用信息。 */
+export async function handleWorktreeBranches(
+  ctx: Context,
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  options: SnapshotOptions = {},
+): Promise<void> {
+  if (options.forceLocal !== true && readRemoteClientState(ctx).isRemote) {
+    const tier1 = await tryCallRemotePluginRoute(ctx, 'worktree-branches', body, options.signal)
+    if (tier1.supported) {
+      return json(res, tier1.status, tier1.payload)
+    }
+    return json(res, 400, {
+      ok: false,
+      message: '远端主机上的 dsh-worktree-groups 插件尚未升级支持分支列表查询',
+    })
+  }
+
+  const repoPathRaw = bodyString(body, 'repoPath')
+  if (repoPathRaw === undefined) return json(res, 400, { ok: false, message: '缺少 repoPath' })
+
+  let snapshot: TreeSnapshot
+  try {
+    snapshot = await collectSnapshot(ctx, options)
+  } catch (error) {
+    return json(res, 400, { ok: false, message: failMessage(error) })
+  }
+
+  const verdict = assertKnown(repoPathRaw, snapshot.knownRepoPaths, 'repoPath')
+  if (!verdict.ok) return json(res, 400, { ok: false, message: verdict.message })
+  const repoPath = verdict.path
+
+  if (!(await pathExists(repoPath))) {
+    return json(res, 400, { ok: false, message: `repoPath 不存在：${repoPath}` })
+  }
+
+  try {
+    const branches = await listRepoBranches(repoPath, options.signal)
+    json(res, 200, { ok: true, branches })
+  } catch (error) {
+    json(res, 400, { ok: false, message: failMessage(error) })
+  }
 }
 
 /** `POST /worktree-create` 的处理器（导出以便直接单测入参校验）。

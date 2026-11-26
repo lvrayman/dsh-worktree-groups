@@ -2301,3 +2301,54 @@ test('2026-11-25/AC1-AC2 接线：MenuLayer 向 P.Menu 传入 CSS 锚定 anchorP
   )
 })
 
+test('2026-11-26/AC1-AC3 CreateWorktreeDialog：无固定过宽 minWidth 裁切，且接线 IDEA 表单与全量分支查询', () => {
+  let createDialogFn = null
+  walk(sidebar.sourceFile, (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'CreateWorktreeDialog') {
+      createDialogFn = node
+    }
+  })
+  assert.ok(createDialogFn !== null, '必须定义 CreateWorktreeDialog')
+  const text = createDialogFn.getText(sidebar.sourceFile)
+
+  // AC1：禁止固定 > 0 的 minWidth 撑破宿主 P.Modal
+  assert.doesNotMatch(
+    text,
+    /minWidth\s*:\s*[1-9]\d*/,
+    'CreateWorktreeDialog 内部容器不得写死正数 minWidth（会超出 P.Modal 导致右侧裁切）',
+  )
+  assert.match(text, /minWidth\s*:\s*0/, 'CreateWorktreeDialog 必须设置 minWidth: 0 防止溢出')
+  assert.match(text, /boxSizing\s*:\s*['"]border-box['"]/, 'CreateWorktreeDialog 必须使用 border-box')
+
+  // AC2/AC3：接线 worktree-branches、evaluateWorktreeForm、applyWorktreeFormChange、pickDirectory
+  assert.match(text, /ROUTE_WORKTREE_BRANCHES/, '必须调用 /worktree-branches 拉取全量分支')
+  assert.match(text, /evaluateWorktreeForm/, '必须通过纯函数 evaluateWorktreeForm 校验与推导 payload')
+  assert.match(text, /applyWorktreeFormChange/, '必须通过纯函数 applyWorktreeFormChange 联动更新目录名')
+  assert.match(text, /pickDirectory/, '必须支持目录选择按钮')
+
+  // 2026-11-26 复验修正：
+  // 1) 弹窗加宽到 ~740px（原 380px 的约两倍），通过插件专属 className 覆盖宿主 Modal 默认窄宽
+  assert.match(text, /wtg-worktree-modal/, '必须为 P.Modal 附加专属宽弹窗样式类')
+  assert.match(text, /740px/, '弹窗宽度应至少加宽到 ~740px（约原宽度两倍）')
+  // 2) 新建分支输入框在未勾选时也必须可输入（不得用 !form.newBranchChecked 禁用）
+  assert.doesNotMatch(
+    text,
+    /disabled\s*:\s*busy\s*\|\|\s*!form\.newBranchChecked/,
+    '新建分支输入框在未勾选时也应允许直接输入（输入即自动勾选）',
+  )
+  // 3) 单 worktree 仓不得在 buildTreeView 里把自身分支从 baseCandidates 过滤掉
+  let buildTreeViewFn = null
+  walk(sidebar.sourceFile, (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'buildTreeView') {
+      buildTreeViewFn = node
+    }
+  })
+  assert.ok(buildTreeViewFn !== null, '必须定义 buildTreeView')
+  assert.doesNotMatch(
+    buildTreeViewFn.getText(sidebar.sourceFile),
+    /branchPool\.filter\(\(branch\)\s*=>\s*branch\s*!==\s*node\.branch\)/,
+    '单 worktree 仓不得把自身分支从 baseCandidates 过滤掉（否则未重启宿主时分支下拉为空）',
+  )
+})
+
+

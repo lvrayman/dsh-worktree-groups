@@ -31,6 +31,15 @@ import { jsx as jsxRaw, jsxs as jsxsRaw } from 'react/jsx-runtime'
 import { createSeatT, createT, zh, type Translate } from './locales.js'
 import { iconSize, resolveIcon, type IconName } from './icons.js'
 import {
+  applyWorktreeFormChange,
+  createInitialWorktreeForm,
+  defaultProjectNameFor,
+  evaluateWorktreeForm,
+  type WorktreeFormBranch,
+  type WorktreeFormHint,
+  type WorktreeFormState,
+} from './worktree-form.js'
+import {
   currentSessionIdOf,
   liveStateOf,
   runningSignature,
@@ -284,6 +293,7 @@ const RAIL_BUTTON = 36
 /** 树数据路由（契约 §1.5）。 */
 const ROUTE_TREE = '/dsh-worktree-groups/tree'
 const ROUTE_WORKSPACE_OPEN = '/dsh-worktree-groups/workspace-open'
+const ROUTE_WORKTREE_BRANCHES = '/dsh-worktree-groups/worktree-branches'
 const ROUTE_WORKTREE_CREATE = '/dsh-worktree-groups/worktree-create'
 const ROUTE_WORKTREE_REMOVE = '/dsh-worktree-groups/worktree-remove'
 const ROUTE_REVEAL = '/dsh-worktree-groups/reveal'
@@ -865,6 +875,8 @@ function iconButtonStyle(visible: boolean): CSSProperties {
 /** 输入控件统一样式。 */
 function fieldStyle(): CSSProperties {
   return {
+    width: '100%',
+    minWidth: 0,
     height: 34,
     boxSizing: 'border-box',
     border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.3))',
@@ -924,6 +936,10 @@ interface WorktreeExtra {
   repoPath?: string
   /** 已注册工作区 id；`undefined` = 未注册（懒注册，D5）。 */
   workspaceId?: string
+  /** 该 worktree 当前检出的分支名（供新建 worktree 弹窗初始分支种子使用）。 */
+  branch?: string
+  /** 是否为主工作树（供新建 worktree 弹窗识别默认当前分支）。 */
+  isMain?: boolean
   /** 同仓其它 worktree 的分支名（新建 worktree 弹窗的起始分支候选）。 */
   baseCandidates: string[]
 }
@@ -977,8 +993,10 @@ interface RenameState {
 interface CreateState {
   /** 主仓路径（`worktree-create.repoPath`）。 */
   repoPath: string
-  /** 分支候选（同仓其它 worktree 的分支名）。 */
+  /** 分支候选（同仓 worktree 的分支名）。 */
   baseCandidates: string[]
+  /** 由当前树视图派生的初始分支种子（含已检出 worktree 信息，拉取 `/worktree-branches` 前立即可用）。 */
+  initialBranches?: WorktreeFormBranch[]
   /** 弹窗标题里显示的名字。 */
   label: string
 }
@@ -1477,35 +1495,6 @@ function MoreRowView(props: {
 // 弹窗零件
 // ────────────────────────────────────────────────────────────────────────────
 
-/** 弹窗表单行（label 在上、控件在下）。 */
-function FieldRow(props: { label: string; children?: ReactNode }): ReactNode {
-  return jsxs('label', {
-    style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12.5 },
-    children: [
-      jsx('span', { key: 'label', style: dimText(12), children: props.label }),
-      props.children,
-    ],
-  })
-}
-
-/** 单选框 + 文案。 */
-function RadioOption(props: { id: string; label: string; checked: boolean; onSelect(): void }): ReactNode {
-  return jsxs('label', {
-    htmlFor: props.id,
-    style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' },
-    children: [
-      jsx('input', {
-        id: props.id,
-        type: 'radio',
-        checked: props.checked,
-        onChange: props.onSelect,
-        style: { accentColor: 'var(--dsw-alias-brand-primary)', width: 14, height: 14, margin: 0, cursor: 'pointer' },
-      }),
-      props.label,
-    ],
-  })
-}
-
 /** 弹窗底部按钮行。 */
 function DialogActions(props: {
   t: Translate
@@ -1572,7 +1561,7 @@ function RenameDialog(props: {
     title,
     closeLabel: props.t('dialog.cancel'),
     children: jsxs('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 320 },
+      style: { display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' },
       children: [
         jsx('input', {
           key: 'input',
@@ -1653,7 +1642,7 @@ function AddWorkspaceDialog(props: {
     title,
     closeLabel: props.t('dialog.cancel'),
     children: jsxs('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 360 },
+      style: { display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' },
       children: [
         jsx('input', {
           key: 'path',
@@ -1690,11 +1679,65 @@ function AddWorkspaceDialog(props: {
   })
 }
 
+/** 把 `WorktreeFormHint` 渲染为中文提示文案。 */
+function formatWorktreeHint(hint: WorktreeFormHint | null, t: Translate): string | null {
+  if (hint === null) return null
+  switch (hint.code) {
+    case 'branchCheckedOut':
+      return t('worktree.hint.branchCheckedOut', { branch: hint.branch, worktreeName: hint.worktreeName })
+    case 'branchExists':
+      return t('worktree.hint.branchExists', { branch: hint.branch })
+    case 'newBranchRequired':
+      return t('worktree.hint.newBranchRequired')
+    case 'invalidProjectName':
+      return t('worktree.hint.invalidProjectName')
+    case 'invalidLocation':
+      return t('worktree.hint.invalidLocation')
+    case 'sameAsMainRepo':
+      return t('worktree.hint.sameAsMainRepo')
+  }
+}
+
+/** 从 `state.baseCandidates` 构造拉取 `/worktree-branches` 前的初始分支种子。 */
+function seedBranchesFromCandidates(repoPath: string, candidates: readonly string[]): WorktreeFormBranch[] {
+  return candidates.map((name, index) => ({
+    name,
+    kind: 'local',
+    ...(index === 0 ? { isCurrent: true, checkedOutWorktreeName: baseName(repoPath), checkedOutWorktreePath: repoPath } : {}),
+  }))
+}
+
+/** 校验并归一化 `/worktree-branches` 返回的分支数组。 */
+function parseBranchesResponse(raw: unknown): WorktreeFormBranch[] {
+  if (!Array.isArray(raw)) return []
+  const out: WorktreeFormBranch[] = []
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const name = typeof rec['name'] === 'string' ? rec['name'].trim() : ''
+    if (name === '') continue
+    const kind = rec['kind'] === 'remote' ? 'remote' : 'local'
+    const entry: WorktreeFormBranch = { name, kind }
+    if (rec['isCurrent'] === true) entry.isCurrent = true
+    if (typeof rec['checkedOutWorktreeName'] === 'string' && rec['checkedOutWorktreeName'] !== '') {
+      entry.checkedOutWorktreeName = rec['checkedOutWorktreeName']
+    }
+    if (typeof rec['checkedOutWorktreePath'] === 'string' && rec['checkedOutWorktreePath'] !== '') {
+      entry.checkedOutWorktreePath = rec['checkedOutWorktreePath']
+    }
+    out.push(entry)
+  }
+  return out
+}
+
 /**
- * 新建 worktree 弹窗（D7）：分支名 + 是否新建分支 + 起始分支 + **只读路径预览**。
- *
- * 预览路径与宿主 `worktree-create` 的默认算法同构
- * （`<主仓父目录>/<主仓名>-<分支名 sanitize>`，`/` 与空格换成 `-`）。
+ * 新建 worktree 弹窗（2026-11-26 IDEA 风格重构）：
+ * - 基于分支（`From branch`）：全量本地/远端分支下拉，标出已在 worktree 检出的分支；
+ * - `[ ] 新建分支`（`New branch`）：复选框 + 输入框，默认不勾选；
+ * - 目录名（`Project name`）：默认 `<主仓名>-<有效分支>`，未手动编辑前自动联动；
+ * - 位置（`Location`）：默认 `<主仓父目录>`，可手动编辑或点目录图标调用 `pickDirectory()`；
+ * - 底部预览 `worktree 将创建在：<Location>/<Project name>` + 内联校验提示；
+ * - 布局彻底响应式（`width: '100%'`, `minWidth: 0`, `boxSizing: 'border-box'`），绝不被 `P.Modal` 裁切。
  */
 function CreateWorktreeDialog(props: {
   state: CreateState | null
@@ -1706,148 +1749,412 @@ function CreateWorktreeDialog(props: {
   onError(message: string): void
   onBusy(text: string | null): void
   post(route: string, body: Record<string, unknown>): Promise<Any>
+  pickDirectory?: () => Promise<string | null>
 }): ReactNode {
-  const [branch, setBranch] = useState('')
-  const [createBranch, setCreateBranch] = useState(true)
-  const [baseRef, setBaseRef] = useState('')
-  const [busy, setBusy] = useState(false)
   const state = props.state
   const stateKey = state === null ? '' : `${state.repoPath}\u0000${state.label}`
+  const [branches, setBranches] = useState<WorktreeFormBranch[]>([])
+  const [loadingBranches, setLoadingBranches] = useState(false)
+  const [form, setForm] = useState<WorktreeFormState>(() =>
+    createInitialWorktreeForm(state?.repoPath ?? '', []),
+  )
+  const [busy, setBusy] = useState(false)
+  const [submitError, setSubmitError] = useState<string | null>(null)
+  const newBranchInputRef = useRef<HTMLInputElement | null>(null)
+  const postRef = useRef(props.post)
+  postRef.current = props.post
 
   useEffect(() => {
     if (state === null) return
-    setBranch('')
-    setCreateBranch(true)
-    setBaseRef(state.baseCandidates[0] ?? '')
+    const seed =
+      state.initialBranches !== undefined && state.initialBranches.length > 0
+        ? state.initialBranches
+        : seedBranchesFromCandidates(state.repoPath, state.baseCandidates)
+    setBranches(seed)
+    setForm(createInitialWorktreeForm(state.repoPath, seed))
     setBusy(false)
+    setSubmitError(null)
+    setLoadingBranches(true)
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await postRef.current(ROUTE_WORKTREE_BRANCHES, { repoPath: state.repoPath })
+        if (cancelled) return
+        const fetched = res?.ok === true ? parseBranchesResponse(res.branches) : []
+        if (fetched.length > 0) {
+          setBranches(fetched)
+          setForm((prev) => {
+            const hasCurrent = fetched.some((b) => b.name === prev.fromBranch)
+            const nextFrom = hasCurrent
+              ? prev.fromBranch
+              : (fetched.find((b) => b.isCurrent)?.name ?? fetched[0]?.name ?? prev.fromBranch)
+            const next: WorktreeFormState = { ...prev, fromBranch: nextFrom }
+            if (!prev.projectNameTouched) {
+              next.projectName = defaultProjectNameFor(state.repoPath, next, fetched)
+            }
+            return next
+          })
+        }
+      } catch {
+        // 远端旧插件或偶发失败：保留 seedBranches，不阻塞用户创建
+      } finally {
+        if (!cancelled) setLoadingBranches(false)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
     // stateKey 是 state 的身份；用它做依赖避免每次渲染都重置表单。
-  }, [stateKey, state])
+  }, [stateKey])
 
   if (state === null) return null
 
   const t = props.t
   const repoPath = state.repoPath
-  const trimmed = branch.trim()
-  const sanitized = trimmed.replace(/[/\\]+/g, '-').replace(/\s+/g, '-')
-  const preview = `${parentDirOf(repoPath)}/${baseName(repoPath)}-${sanitized !== '' ? sanitized : '<分支名>'}`
-  const canSubmit = !busy && sanitized !== ''
+  const evaluation = evaluateWorktreeForm(form, repoPath, branches)
+  const hintText = formatWorktreeHint(evaluation.hint, t)
+  const canSubmit = !busy && evaluation.canSubmit && evaluation.payload !== null
+
+  const localBranches = branches.filter((b) => b.kind === 'local')
+  const remoteBranches = branches.filter((b) => b.kind === 'remote')
+
+  const updateForm = (patch: Partial<WorktreeFormState>): void => {
+    setSubmitError(null)
+    setForm((prev) => applyWorktreeFormChange(prev, patch, repoPath, branches))
+  }
+
+  const handleSubmit = (): void => {
+    const payload = evaluation.payload
+    if (busy || !evaluation.canSubmit || payload === null) return
+    setBusy(true)
+    setSubmitError(null)
+    props.onBusy(t('worktree.creating'))
+    void (async () => {
+      try {
+        const body = await props.post(ROUTE_WORKTREE_CREATE, { ...payload })
+        if (body?.ok !== true) {
+          throw new Error(typeof body?.message === 'string' ? body.message : t('error.load'))
+        }
+        props.onClose()
+        if (typeof body.workspaceWarning === 'string' && body.workspaceWarning !== '') {
+          props.onWarning(t('worktree.workspaceWarning', { message: body.workspaceWarning }))
+        } else {
+          props.onWarning(null)
+        }
+        props.onCreated(
+          typeof body.worktreePath === 'string' ? body.worktreePath : undefined,
+          typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
+        )
+      } catch (error: unknown) {
+        setSubmitError(error instanceof Error ? error.message : t('error.load'))
+      } finally {
+        setBusy(false)
+        props.onBusy(null)
+      }
+    })()
+  }
+
+  const handlePickLocation = (): void => {
+    if (busy || typeof props.pickDirectory !== 'function') return
+    void (async () => {
+      try {
+        const picked = await props.pickDirectory!()
+        if (typeof picked === 'string' && picked.trim() !== '') {
+          updateForm({ location: picked.trim() })
+        }
+      } catch {
+        // 原生目录选择器不可用时静默忽略，用户仍可手动输入路径
+      }
+    })()
+  }
+
+  const onInputKeyDown = (event: Any): void => {
+    if (event?.key === 'Enter' && canSubmit) {
+      event.preventDefault?.()
+      handleSubmit()
+    }
+  }
+
+  const labelCellStyle: CSSProperties = {
+    fontSize: 12.5,
+    color: 'var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))',
+    whiteSpace: 'nowrap',
+    userSelect: 'none',
+  }
+
+  const optionLabel = (b: WorktreeFormBranch): string =>
+    b.checkedOutWorktreeName !== undefined ? `${b.name} (${b.checkedOutWorktreeName})` : b.name
 
   return jsx(P.Modal, {
     open: true,
     onClose: props.onClose,
     title: t('worktree.createTitle', { name: state.label }),
     closeLabel: t('worktree.cancel'),
+    className: 'wtg-worktree-modal',
+    contentClassName: 'wtg-worktree-modal-content',
     children: jsxs('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: 12, minWidth: 380 },
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 14,
+        width: '100%',
+        maxWidth: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
+      },
       children: [
-        jsx(FieldRow, {
-          key: 'branch',
-          label: t('worktree.branchName'),
-          children: jsx('input', {
-            value: branch,
-            'aria-label': t('worktree.branchName'),
-            placeholder: 'feature/demo',
-            onChange: (event: Any) => { setBranch(String(event?.target?.value ?? '')) },
-            style: fieldStyle(),
-          }),
+        jsx('style', {
+          key: 'modal-width-style',
+          children:
+            '.wtg-worktree-modal{width:min(740px,calc(100vw - 48px)) !important;max-width:calc(100vw - 48px) !important;box-sizing:border-box !important;}' +
+            '.wtg-worktree-modal-content{width:100% !important;max-width:100% !important;box-sizing:border-box !important;}',
         }),
-        jsx(FieldRow, {
-          key: 'mode',
-          label: t('worktree.newBranch'),
-          children: jsxs('div', {
-            style: { display: 'flex', gap: 14 },
-            children: [
-              jsx(RadioOption, {
-                key: 'new',
-                id: 'wtg-new-branch',
-                label: t('worktree.newBranch'),
-                checked: createBranch,
-                onSelect: () => { setCreateBranch(true) },
-              }),
-              jsx(RadioOption, {
-                key: 'reuse',
-                id: 'wtg-use-branch',
-                label: t('worktree.useExisting'),
-                checked: !createBranch,
-                onSelect: () => { setCreateBranch(false) },
-              }),
-            ],
-          }),
+        jsxs('div', {
+          key: 'grid',
+          style: {
+            display: 'grid',
+            gridTemplateColumns: '96px minmax(0, 1fr)',
+            columnGap: 12,
+            rowGap: 12,
+            alignItems: 'center',
+            width: '100%',
+            minWidth: 0,
+          },
+          children: [
+            // Row 1: From branch
+            jsx('label', {
+              key: 'from-label',
+              htmlFor: 'wtg-from-branch',
+              style: labelCellStyle,
+              children: `${t('worktree.fromBranch')}:`,
+            }),
+            jsx('select', {
+              key: 'from-select',
+              id: 'wtg-from-branch',
+              value: form.fromBranch,
+              disabled: busy || (branches.length === 0 && loadingBranches),
+              'aria-label': t('worktree.fromBranch'),
+              onChange: (event: Any) => { updateForm({ fromBranch: String(event?.target?.value ?? '') }) },
+              style: { ...fieldStyle(), padding: '0 8px' },
+              children:
+                branches.length === 0
+                  ? [
+                      jsx('option', {
+                        key: 'loading',
+                        value: '',
+                        children: loadingBranches ? t('worktree.loadingBranches') : '—',
+                      }),
+                    ]
+                  : [
+                      ...(localBranches.length > 0
+                        ? [
+                            jsx('optgroup', {
+                              key: 'local-group',
+                              label: t('worktree.localBranches'),
+                              children: localBranches.map((b) =>
+                                jsx('option', { key: `local:${b.name}`, value: b.name, children: optionLabel(b) }),
+                              ),
+                            }),
+                          ]
+                        : []),
+                      ...(remoteBranches.length > 0
+                        ? [
+                            jsx('optgroup', {
+                              key: 'remote-group',
+                              label: t('worktree.remoteBranches'),
+                              children: remoteBranches.map((b) =>
+                                jsx('option', { key: `remote:${b.name}`, value: b.name, children: b.name }),
+                              ),
+                            }),
+                          ]
+                        : []),
+                    ],
+            }),
+
+            // Row 2: [ ] New branch + input
+            jsxs('label', {
+              key: 'new-branch-check',
+              htmlFor: 'wtg-new-branch-check',
+              style: {
+                ...labelCellStyle,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                cursor: 'pointer',
+              },
+              children: [
+                jsx('input', {
+                  key: 'checkbox',
+                  id: 'wtg-new-branch-check',
+                  type: 'checkbox',
+                  checked: form.newBranchChecked,
+                  disabled: busy,
+                  onChange: (event: Any) => {
+                    const checked = Boolean(event?.target?.checked)
+                    updateForm({ newBranchChecked: checked })
+                    if (checked) {
+                      setTimeout(() => { newBranchInputRef.current?.focus() }, 0)
+                    }
+                  },
+                  style: {
+                    accentColor: 'var(--dsw-alias-brand-primary)',
+                    width: 14,
+                    height: 14,
+                    margin: 0,
+                    cursor: 'pointer',
+                    flex: 'none',
+                  },
+                }),
+                `${t('worktree.newBranch')}:`,
+              ],
+            }),
+            jsx('input', {
+              key: 'new-branch-input',
+              ref: newBranchInputRef,
+              value: form.newBranch,
+              disabled: busy,
+              'aria-label': t('worktree.newBranch'),
+              placeholder: t('worktree.newBranchPlaceholder'),
+              onChange: (event: Any) => { updateForm({ newBranch: String(event?.target?.value ?? '') }) },
+              onKeyDown: onInputKeyDown,
+              style: fieldStyle(),
+            }),
+
+            // Row 3: Project name
+            jsx('label', {
+              key: 'project-name-label',
+              htmlFor: 'wtg-project-name',
+              style: labelCellStyle,
+              children: `${t('worktree.projectName')}:`,
+            }),
+            jsx('input', {
+              key: 'project-name-input',
+              id: 'wtg-project-name',
+              value: form.projectName,
+              disabled: busy,
+              'aria-label': t('worktree.projectName'),
+              onChange: (event: Any) => { updateForm({ projectName: String(event?.target?.value ?? '') }) },
+              onKeyDown: onInputKeyDown,
+              style: fieldStyle(),
+            }),
+
+            // Row 4: Location + folder picker button
+            jsx('label', {
+              key: 'location-label',
+              htmlFor: 'wtg-location',
+              style: labelCellStyle,
+              children: `${t('worktree.location')}:`,
+            }),
+            jsxs('div', {
+              key: 'location-input-wrap',
+              style: { display: 'flex', alignItems: 'center', gap: 6, width: '100%', minWidth: 0 },
+              children: [
+                jsx('input', {
+                  key: 'location-input',
+                  id: 'wtg-location',
+                  value: form.location,
+                  disabled: busy,
+                  'aria-label': t('worktree.location'),
+                  onChange: (event: Any) => { updateForm({ location: String(event?.target?.value ?? '') }) },
+                  onKeyDown: onInputKeyDown,
+                  style: { ...fieldStyle(), flex: 1, minWidth: 0 },
+                }),
+                typeof props.pickDirectory === 'function'
+                  ? jsx('button', {
+                      key: 'pick-location',
+                      type: 'button',
+                      disabled: busy,
+                      title: t('worktree.chooseLocation'),
+                      'aria-label': t('worktree.chooseLocation'),
+                      onClick: handlePickLocation,
+                      style: {
+                        flex: 'none',
+                        width: 34,
+                        height: 34,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxSizing: 'border-box',
+                        border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.3))',
+                        borderRadius: 10,
+                        background: 'transparent',
+                        color: 'var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))',
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                      },
+                      children: icon('folderOpen', { size: 15 }),
+                    })
+                  : null,
+              ].filter(present),
+            }),
+          ],
         }),
-        createBranch && state.baseCandidates.length > 0
-          ? jsx(FieldRow, {
-              key: 'base',
-              label: t('worktree.baseBranch'),
-              children: jsx('select', {
-                value: baseRef,
-                'aria-label': t('worktree.baseBranch'),
-                onChange: (event: Any) => { setBaseRef(String(event?.target?.value ?? '')) },
-                style: { ...fieldStyle(), padding: '0 8px' },
-                children: state.baseCandidates.map((candidate: string) =>
-                  jsx('option', { key: candidate, value: candidate, children: candidate }),
-                ),
-              }),
+
+        // Preview path ("The worktree will be created in:")
+        jsxs('div', {
+          key: 'preview',
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            padding: '8px 10px',
+            borderRadius: 8,
+            background: 'var(--dsw-alias-bg-multi-select, rgba(127,127,127,0.08))',
+            minWidth: 0,
+            boxSizing: 'border-box',
+          },
+          children: [
+            jsx('span', { key: 'preview-label', style: dimText(11.5), children: t('worktree.willCreateIn') }),
+            jsx('code', {
+              key: 'preview-path',
+              style: {
+                fontSize: 12,
+                color: 'var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))',
+                wordBreak: 'break-all',
+                lineHeight: 1.4,
+              },
+              children: evaluation.targetPath || '—',
+            }),
+          ],
+        }),
+
+        // Inline hint (e.g. branch already checked out)
+        hintText !== null
+          ? jsx('div', {
+              key: 'hint',
+              style: {
+                fontSize: 12,
+                color: 'var(--dsw-alias-state-warn-primary, #d19a2f)',
+                lineHeight: 1.4,
+                wordBreak: 'break-word',
+              },
+              children: hintText,
             })
           : null,
-        jsx(FieldRow, {
-          key: 'path',
-          label: t('worktree.path'),
-          children: jsx('code', {
-            style: {
-              display: 'block',
-              padding: '6px 10px',
-              borderRadius: 8,
-              background: 'var(--dsw-alias-bg-multi-select, rgba(127,127,127,0.08))',
-              color: 'var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))',
-              fontSize: 12,
-              wordBreak: 'break-all',
-            },
-            children: preview,
-          }),
-        }),
-        jsx('div', { key: 'hint', style: dimText(11.5), children: t('worktree.pathHint') }),
+
+        // Submit error
+        submitError !== null
+          ? jsx('div', {
+              key: 'error',
+              style: {
+                fontSize: 12,
+                color: 'var(--dsw-alias-state-error-primary, #d9534f)',
+                lineHeight: 1.4,
+                wordBreak: 'break-word',
+              },
+              children: submitError,
+            })
+          : null,
+
         jsx(DialogActions, {
           key: 'actions',
           t,
           busy,
-          confirmText: busy ? t('worktree.creating') : t('worktree.confirm'),
+          confirmText: busy ? t('worktree.creating') : t('worktree.createAction'),
           disabled: !canSubmit,
           onCancel: props.onClose,
-          onConfirm: () => {
-            setBusy(true)
-            props.onBusy(t('worktree.creating'))
-            void (async () => {
-              try {
-                const body = await props.post(ROUTE_WORKTREE_CREATE, {
-                  repoPath,
-                  branch: trimmed,
-                  createBranch,
-                  ...(createBranch && baseRef !== '' ? { baseRef } : {}),
-                })
-                if (body?.ok !== true) {
-                  throw new Error(typeof body?.message === 'string' ? body.message : t('error.load'))
-                }
-                props.onClose()
-                // **D10**：worktree 建成了（`ok:true`），但注册工作区可能失败 ——
-                // 此时没有 `workspaceId`，也就不会有自动新会话。必须让这条「部分成功」
-                // 对用户可见，否则界面表现得像完全成功而用户等不到新会话。
-                if (typeof body.workspaceWarning === 'string' && body.workspaceWarning !== '') {
-                  props.onWarning(t('worktree.workspaceWarning', { message: body.workspaceWarning }))
-                } else {
-                  props.onWarning(null)
-                }
-                props.onCreated(
-                  typeof body.worktreePath === 'string' ? body.worktreePath : undefined,
-                  typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
-                )
-              } catch (error: unknown) {
-                props.onError(error instanceof Error ? error.message : t('error.load'))
-              } finally {
-                setBusy(false)
-                props.onBusy(null)
-              }
-            })()
-          },
+          onConfirm: handleSubmit,
         }),
       ].filter(present),
     }),
@@ -1917,7 +2224,7 @@ function RemoveWorktreeDialog(props: {
     title: t('worktree.remove'),
     closeLabel: t('dialog.cancel'),
     children: jsxs('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 340 },
+      style: { display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' },
       children: [
         jsx('div', {
           key: 'confirm',
@@ -3320,6 +3627,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
         reload,
         setLoadError,
         collectBaseCandidates: (repoPath: string) => collectBaseCandidates(view, repoPath),
+        collectInitialBranches: (repoPath: string) => collectInitialBranches(view, repoPath),
         // D10：**仅 `manual === true` 时**显示「恢复默认排序」。判据在 MenuLayer 里
         // （`orderIsManual`），这里只给「切回默认」的动作 + 当前是否 manual 的事实。
         orderIsManual: manualOrder.manual === true,
@@ -3350,6 +3658,7 @@ function SidebarBrowserInner(props: SidebarProps): ReactNode {
         onWarning: setNotice,
         onError: setLoadError,
         post: actions.post,
+        pickDirectory: actions.pickDirectory,
         onCreated: (worktreePath: string | undefined, workspaceId: string | undefined) => {
           // D7：成功后展开该 worktree 行并自动开一个新会话。
           if (worktreePath !== undefined && worktreePath !== '') {
@@ -3434,6 +3743,7 @@ function MenuLayer(props: {
   reload(): void
   setLoadError(message: string | null): void
   collectBaseCandidates(repoPath: string): string[]
+  collectInitialBranches(repoPath: string): WorktreeFormBranch[]
   /** D10：当前是否处于手动排序（`localStorage` 里 `manual === true`）。 */
   orderIsManual: boolean
   /** D10：「恢复默认排序」——清本地顺序 + 立即重排。 */
@@ -3547,6 +3857,7 @@ function MenuLayer(props: {
           props.onCreateWorktree({
             repoPath: target.extra.mainPath,
             baseCandidates: props.collectBaseCandidates(target.extra.mainPath),
+            initialBranches: props.collectInitialBranches(target.extra.mainPath),
             label: target.title,
           })
           return
@@ -3625,9 +3936,40 @@ function collectBaseCandidates(view: TreeView, repoPath: string): string[] {
   for (const extra of view.worktrees.values()) {
     // 缺 `repoPath` 的行（未注册 / 非 git）**不参与**合并：宁少不错。
     if (extra.repoPath === undefined || normalizeRepoKey(extra.repoPath) !== target) continue
+    if (extra.branch !== undefined && extra.branch !== '') seen.add(extra.branch)
     for (const branch of extra.baseCandidates) seen.add(branch)
   }
   return [...seen]
+}
+
+/**
+ * 从当前树视图收集某主仓的初始分支种子（含每个 worktree 已检出的分支与目录名），
+ * 供弹窗在 `/worktree-branches` 返回前（或宿主尚未重启时）立即展示当前分支与占用状态。
+ */
+function collectInitialBranches(view: TreeView, repoPath: string): WorktreeFormBranch[] {
+  const target = normalizeRepoKey(repoPath)
+  if (target === undefined) return []
+  const out: WorktreeFormBranch[] = []
+  const seen = new Set<string>()
+  for (const extra of view.worktrees.values()) {
+    if (extra.repoPath === undefined || normalizeRepoKey(extra.repoPath) !== target) continue
+    const branch = extra.branch
+    if (branch === undefined || branch === '' || seen.has(branch)) continue
+    seen.add(branch)
+    out.push({
+      name: branch,
+      kind: 'local',
+      ...(extra.isMain === true ? { isCurrent: true } : {}),
+      checkedOutWorktreeName: baseName(extra.path),
+      checkedOutWorktreePath: extra.path,
+    })
+  }
+  out.sort((a, b) => {
+    if (a.isCurrent === true && b.isCurrent !== true) return -1
+    if (b.isCurrent === true && a.isCurrent !== true) return 1
+    return a.name.localeCompare(b.name)
+  })
+  return out
 }
 
 /**
@@ -3705,7 +4047,9 @@ function buildTreeView(tree: TreeResponse | null, input: SidebarModelInput): Tre
       worktrees.set(key, {
         path: node.path,
         ...(repoPath === undefined ? {} : { repoPath }),
-        baseCandidates: branchPool.filter((branch) => branch !== node.branch),
+        ...(node.branch === undefined ? {} : { branch: node.branch }),
+        isMain: node.isMain,
+        baseCandidates: [...branchPool],
         ...(node.workspaceId === undefined ? {} : { workspaceId: node.workspaceId }),
       })
     }

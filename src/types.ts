@@ -89,6 +89,20 @@ export interface ProjectNode {
   flatSessions: SessionRow[]
 }
 
+/** 仓库的单个分支条目（供 IDEA 风格新建 worktree 弹窗的 `From branch` 下拉使用）。 */
+export interface BranchEntry {
+  /** 分支短名（如 `master`、`feature/ohos`、`origin/main`）。 */
+  name: string
+  /** `'local'`（`refs/heads/*`）或 `'remote'`（`refs/remotes/*`）。 */
+  kind: 'local' | 'remote'
+  /** 若该本地分支已在某个 worktree 检出，记录该 worktree 的目录名（basename）。 */
+  checkedOutWorktreeName?: string
+  /** 若该本地分支已在某个 worktree 检出，记录该 worktree 的归一化绝对路径。 */
+  checkedOutWorktreePath?: string
+  /** 是否为 `repoPath` 当前检出的分支。 */
+  isCurrent?: boolean
+}
+
 /** 已归档的工作空间摘要（2026-10-21 WSR1/WSR2，供设置页展示与恢复）。 */
 export interface ArchivedProjectRow {
   /** 项目键（git 为 commonDir，非 git 为 `ws:<workspaceId>`）。 */

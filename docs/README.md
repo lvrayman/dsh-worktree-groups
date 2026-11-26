@@ -135,6 +135,7 @@
 | 2026-11-22 | [dsh remote 控制远端机器 B 时侧栏切换显示机器 B 的 Worktree 工作区树](worklog/2026-11-22-remote-worktree-display.md) |
 | 2026-11-24 | [单个会话归档修复与 DSH 原生会话右键菜单支持](worklog/2026-11-24-native-session-context-menu-and-archive.md) |
 | 2026-11-25 | [修复 DSH v0.2.2+ 下侧栏菜单按钮点击不弹出菜单（`Menu.anchorPoint` 迁移）](worklog/2026-11-25-menu-anchor-point-fix.md) |
+| 2026-11-26 | [修复新建 Worktree 弹窗显示不全并重构为 IDEA 风格交互](worklog/2026-11-26-create-worktree-idea-ux.md) |
 
 ## 新增文档归档约定
 

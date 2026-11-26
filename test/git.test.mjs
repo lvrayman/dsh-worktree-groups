@@ -33,7 +33,7 @@ import { basename, join } from 'node:path'
 import { after, test } from 'node:test'
 import { promisify } from 'node:util'
 
-import { normalizePath, parseWorktreeList, resolveToplevel, scanRepo } from '../lib/git.js'
+import { listRepoBranches, normalizePath, parseWorktreeList, resolveToplevel, scanRepo } from '../lib/git.js'
 import { buildProjects } from '../lib/projects.js'
 
 const pexec = promisify(execFile)
@@ -359,3 +359,57 @@ test('修1 反证: 若 mainPath 被污染成 linked worktree，标题就会错�
   )
   assert.notEqual(built.projects[0].title, MAIN_NAME, '文档化：污染状态下拿不到主仓名')
 })
+
+/* ------------------------------------------------------------------ *
+ * 2026-11-26 IDEA 新建 worktree：listRepoBranches（全量分支 + worktree 占用）
+ * ------------------------------------------------------------------ */
+
+test('2026-11-26/AC2 listRepoBranches: 返回当前分支优先、其余本地分支、远端分支（排除 */HEAD），并标出已检出 worktree', async () => {
+  const fixture = await makeGitFixture('wtg-git-branches', [
+    { dir: 'fixture-repo-ohos', branch: 'feature/ohos' },
+  ])
+  const { root, mainRepo, linked, git } = fixture
+  // 新增一个未检出的本地分支
+  await git(['branch', 'develop'])
+  await git(['branch', 'bugfix/login'])
+  // 模拟一个 bare remote 并 fetch，制造 origin/* 与 origin/HEAD
+  const bare = join(root, 'origin.git')
+  await git(['clone', '--bare', '-q', mainRepo, bare])
+  await git(['remote', 'add', 'origin', bare])
+  await git(['fetch', '-q', 'origin'])
+  await git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main'])
+
+  const branches = await listRepoBranches(mainRepo)
+  const names = branches.map((b) => b.name)
+
+  // 不含 origin/HEAD
+  assert.ok(!names.includes('origin/HEAD'), '必须排除 refs/remotes/*/HEAD 符号引用')
+  // 当前分支排第一
+  assert.equal(branches[0]?.name, 'main')
+  assert.equal(branches[0]?.kind, 'local')
+  assert.equal(branches[0]?.isCurrent, true)
+  assert.equal(branches[0]?.checkedOutWorktreeName, 'fixture-repo')
+  assert.equal(branches[0]?.checkedOutWorktreePath, normalizePath(mainRepo))
+
+  // 其余本地分支按字典序在远端分支之前
+  const localNames = branches.filter((b) => b.kind === 'local').map((b) => b.name)
+  assert.deepEqual(localNames, ['main', 'bugfix/login', 'develop', 'feature/ohos'])
+
+  // 已检出的 linked worktree 分支带 worktree 名与路径；未检出分支不带
+  const ohos = branches.find((b) => b.name === 'feature/ohos')
+  assert.equal(ohos?.checkedOutWorktreeName, 'fixture-repo-ohos')
+  assert.equal(ohos?.checkedOutWorktreePath, normalizePath(linked['feature/ohos']))
+
+  const develop = branches.find((b) => b.name === 'develop')
+  assert.equal(develop?.checkedOutWorktreeName, undefined)
+  assert.equal(develop?.checkedOutWorktreePath, undefined)
+
+  // 远端分支存在且 kind === 'remote'，排在本地分支之后
+  const remoteEntries = branches.filter((b) => b.kind === 'remote')
+  assert.ok(remoteEntries.some((b) => b.name === 'origin/main'), '应包含 origin/main')
+  assert.ok(remoteEntries.some((b) => b.name === 'origin/develop'), '应包含 origin/develop')
+  const firstRemoteIdx = branches.findIndex((b) => b.kind === 'remote')
+  const lastLocalIdx = branches.map((b) => b.kind).lastIndexOf('local')
+  assert.ok(firstRemoteIdx > lastLocalIdx, '远端分支应排在所有本地分支之后')
+})
+

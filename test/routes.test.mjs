@@ -77,6 +77,7 @@ import {
   collectSnapshot,
   defaultWorktreePath,
   handleReveal,
+  handleWorktreeBranches,
   handleWorktreeCreate,
   handleWorktreeRemove,
   isSafeGitArg,
@@ -783,18 +784,15 @@ test('§3 cwd 缺失：空字符串 cwd 也归未分组（不被当成路径 ""�
  * §4 安全白名单（D-5 / D-6 / D-11）—— 真实验证拒绝，不只看返回值
  * ------------------------------------------------------------------ */
 
-test('§4 D-5 validateTargetPath：拒绝仓外 / 穿越 / .git / 非主仓名前缀 / 等于主仓 / 空串', async () => {
+test('§4 D-5（2026-11-26 IDEA 修订）validateTargetPath：拒绝相对路径 / .git / 等于主仓 / 空串 / 隐藏目录；放行自定义位置与目录名', async () => {
   const fixture = await makeGitFixture('wtg-d5-validate')
   const { root, repo } = fixture
   const cases = [
-    ['仓外绝对路径', '/tmp/wtg-evil-should-not-exist/deep'],
-    ['仓外路径（不存在的同级目录）', join(root, '..', 'wtg-evil-sibling')],
-    ['`..` 越狱到仓外', join(repo, '..', 'escape')],
     ['仓内 .git 子目录', join(repo, '.git')],
     ['仓内 .git 下的子路径', join(repo, '.git', 'evil')],
-    ['basename 不以主仓名开头', join(root, 'othername')],
     ['等于主仓自身', repo],
     ['空串', ''],
+    ['相对路径', 'relative-worktree'],
     ['隐藏目录（以 . 开头）', join(root, '.hidden-worktree')],
   ]
   for (const [label, target] of cases) {
@@ -803,6 +801,13 @@ test('§4 D-5 validateTargetPath：拒绝仓外 / 穿越 / .git / 非主仓名�
     assert.equal(typeof verdict.message, 'string', `拒绝时必须给出原因（${label}）`)
     assert.ok(verdict.message.length > 0, `拒绝原因不得为空（${label}）`)
   }
+
+  // 2026-11-26 IDEA 风格：允许自定义 Location 与自定义 Project name
+  const customLocation = await makeRoot('wtg-custom-loc')
+  const customTarget = join(customLocation, 'my-custom-wt')
+  const customVerdict = validateTargetPath(customTarget, repo)
+  assert.equal(customVerdict.ok, true, `应放行自定义位置与目录名：${customTarget}`)
+  assert.equal(customVerdict.path, customTarget)
 })
 
 test('§4 D-5 validateTargetPath：放行「同父目录 + 主仓名前缀」，并回填归一化路径', async () => {
@@ -824,10 +829,9 @@ test('§4 D-5 handler：拒绝的 targetPath 不得创建任何目录，也不�
   const opts = { ledger: ledgerAt(root), now: 1_700_000 }
 
   const rejections = [
-    ['仓外（/tmp/...）', '/tmp/wtg-evil-deep/should-not-exist'],
-    ['`..` 越狱到仓外且 basename 不以主仓名开头', join(repo, '..', 'escaped')],
+    ['父目录不存在（/tmp/...）', '/tmp/wtg-evil-deep/should-not-exist'],
     ['仓内 .git 子路径', join(repo, '.git', 'evil')],
-    ['不以主仓名开头的 basename', join(root, 'attacker-chosen')],
+    ['隐藏目录名', join(root, '.hidden-evil')],
     ['等于主仓自身', repo],
   ]
 
@@ -863,6 +867,70 @@ test('§4 D-5 handler：拒绝的 targetPath 不得创建任何目录，也不�
     }
   }
   assert.deepEqual(await worktreePaths(git), before, '全部拒绝路径都不得改动 git worktree 列表')
+})
+
+test('2026-11-26/AC4 handleWorktreeCreate：支持 IDEA 自定义 Location 与自定义 Project name', async () => {
+  const fixture = await makeGitFixture('wtg-idea-custom-create')
+  const { root, repo } = fixture
+  const customLocation = await makeRoot('wtg-idea-location')
+  const target = join(customLocation, 'my-feature-dir')
+  const opts = { ledger: ledgerAt(root), now: 1_700_000 }
+
+  clearScanCache()
+  const res = makeResponse()
+  await handleWorktreeCreate(
+    makeCtx(services({ workspaceRegistry: fakeRegistry([mainWorkspace(repo)]) })),
+    res,
+    { repoPath: repo, branch: 'feat/custom', createBranch: true, targetPath: target },
+    opts,
+  )
+  assert.equal(res.statusCode, 200, `应放行自定义位置与目录名：${JSON.stringify(res.body)}`)
+  assert.equal(res.body?.ok, true)
+  assert.equal(res.body?.worktreePath, target)
+  assert.equal(existsSync(target), true, '应在自定义路径创建 worktree 目录')
+})
+
+test('2026-11-26/AC2 handleWorktreeBranches：返回已知仓的全量分支并拒绝未知 repoPath', async () => {
+  const fixture = await makeGitFixture('wtg-idea-branches')
+  const { root, repo, git } = fixture
+  await git(['branch', 'develop'])
+  const opts = { ledger: ledgerAt(root), now: 1_700_000 }
+
+  // 缺少 repoPath ⇒ 400
+  const missingRes = makeResponse()
+  await handleWorktreeBranches(
+    makeCtx(services({ workspaceRegistry: fakeRegistry([mainWorkspace(repo)]) })),
+    missingRes,
+    {},
+    opts,
+  )
+  assert.equal(missingRes.statusCode, 400)
+  assert.equal(missingRes.body?.ok, false)
+
+  // 未知 repoPath ⇒ 400
+  const unknownRes = makeResponse()
+  await handleWorktreeBranches(
+    makeCtx(services({ workspaceRegistry: fakeRegistry([mainWorkspace(repo)]) })),
+    unknownRes,
+    { repoPath: '/tmp/not-a-registered-repo' },
+    opts,
+  )
+  assert.equal(unknownRes.statusCode, 400)
+  assert.equal(unknownRes.body?.ok, false)
+
+  // 合法 repoPath ⇒ 200 + branches
+  clearScanCache()
+  const okRes = makeResponse()
+  await handleWorktreeBranches(
+    makeCtx(services({ workspaceRegistry: fakeRegistry([mainWorkspace(repo)]) })),
+    okRes,
+    { repoPath: repo },
+    opts,
+  )
+  assert.equal(okRes.statusCode, 200, `应返回 200：${JSON.stringify(okRes.body)}`)
+  assert.equal(okRes.body?.ok, true)
+  assert.ok(Array.isArray(okRes.body?.branches))
+  assert.ok(okRes.body.branches.some((b) => b.name === 'develop' && b.kind === 'local'))
 })
 
 test('§4 D-5 handler：放行「同父目录 + 主仓名前缀」的 targetPath，并注册为工作区', async () => {
@@ -1731,7 +1799,7 @@ test('§6 降级：registerRoute 的 webServer.register 返回 undefined ⇒ 用
     },
   )
   assert.doesNotThrow(() => registerRoutes(ctx), 'register 不返回 disposer 时不应崩')
-  assert.equal(registered.length, 5, '仍应注册全部 5 个路由')
+  assert.equal(registered.length, Object.keys(ROUTE_PATHS).length, '仍应注册全部路由')
 })
 
 test('§6 降级：ledger.read() 抛错 ⇒ collectSnapshot 用空台账，不崩', async () => {
@@ -1961,7 +2029,7 @@ function fakeWebServer() {
   }
 }
 
-test('§7 注册：registerRoutes 注册 ROUTE_PATHS 里的全部 5 个路由，且 kind 都是 exact', () => {
+test('§7 注册：registerRoutes 注册 ROUTE_PATHS 里的全部 6 个路由，且 kind 都是 exact', () => {
   const fake = fakeWebServer()
   const disposers = []
   const ctx = makeCtx(services({ webServer: fake.server }), {
@@ -1976,8 +2044,8 @@ test('§7 注册：registerRoutes 注册 ROUTE_PATHS 里的全部 5 个路由，
 
   const expected = Object.values(ROUTE_PATHS).sort()
   assert.deepEqual([...fake.routes.keys()].sort(), expected, '注册的路由路径应与 ROUTE_PATHS 完全一致')
-  assert.equal(fake.routes.size, 5, `应注册 5 个路由，实际 ${fake.routes.size}`)
-  assert.equal(disposers.length, 5, '每个路由一个 ctx.effect（宿主契约硬约束 15）')
+  assert.equal(fake.routes.size, expected.length, `应注册 ${expected.length} 个路由，实际 ${fake.routes.size}`)
+  assert.equal(disposers.length, expected.length, '每个路由一个 ctx.effect（宿主契约硬约束 15）')
   for (const [path, route] of fake.routes) {
     assert.equal(route.kind, 'exact', `${path} 必须用 exact 注册（前缀匹配会抢别的插件路由）`)
     assert.equal(typeof route.handler, 'function', `${path} 的 handler 应是函数`)
@@ -1997,7 +2065,7 @@ test('§7 释放：disposer 调用后 handlers 归零（每个 effect 一个路�
   })
 
   registerRoutes(ctx)
-  assert.equal(fake.routes.size, 5, '前置条件：注册了 5 个路由')
+  assert.equal(fake.routes.size, Object.keys(ROUTE_PATHS).length, '前置条件：注册了全部路由')
 
   for (const dispose of disposers) dispose()
 
@@ -2005,11 +2073,11 @@ test('§7 释放：disposer 调用后 handlers 归零（每个 effect 一个路�
   assert.deepEqual(fake.disposed.sort(), Object.values(ROUTE_PATHS).sort(), '每个路由的 disposer 都应被调用')
 })
 
-test('§7 注册：apply(ctx) 走的是同一条注册路径（5 个路由）', () => {
+test('§7 注册：apply(ctx) 走的是同一条注册路径（6 个路由）', () => {
   const fake = fakeWebServer()
   const ctx = makeCtx(services({ webServer: fake.server }))
   apply(ctx)
-  assert.equal(fake.routes.size, 5, 'apply 应注册全部 5 个路由')
+  assert.equal(fake.routes.size, Object.keys(ROUTE_PATHS).length, 'apply 应注册全部路由')
 })
 
 test('§7 注册：registerRoutes 在 webServer.register 抛错时不吞掉（由 apply 兜住）', () => {

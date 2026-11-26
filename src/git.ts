@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { stat } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 
-import type { RepoInfo, WorktreeEntry } from './types.js'
+import type { BranchEntry, RepoInfo, WorktreeEntry } from './types.js'
 
 /** 子进程输出上限；8 MiB 足以容纳超大仓的 `worktree list` / `for-each-ref` 输出。 */
 const MAX_BUFFER = 8 * 1024 * 1024
@@ -334,3 +334,68 @@ export async function scanRepo(repoPath: string, signal?: AbortSignal): Promise<
   const worktrees: WorktreeEntry[] = parsed.map((entry, index) => ({ ...entry, exists: exists[index] === true }))
   return { commonDir, mainPath, worktrees }
 }
+
+/**
+ * 列出仓库的全部本地与远端分支（排除 `refs/remotes/<remote>/HEAD` 符号引用），
+ * 并结合 `git worktree list --porcelain` 标出已被现有 worktree 检出的本地分支。
+ *
+ * 排序规则：当前分支（`HEAD === '*'`）置首 → 其余本地分支字典序 → 远端分支字典序。
+ */
+export async function listRepoBranches(repoPath: string, signal?: AbortSignal): Promise<BranchEntry[]> {
+  if (isAborted(signal)) return []
+
+  const [refsRaw, porcelain] = await Promise.all([
+    runGit(
+      repoPath,
+      ['for-each-ref', '--format=%(refname:short)\t%(refname)\t%(HEAD)\t%(symref)', 'refs/heads', 'refs/remotes'],
+      signal,
+    ),
+    runGitSafe(repoPath, ['worktree', 'list', '--porcelain'], signal),
+  ])
+
+  const checkedOutByBranch = new Map<string, string>()
+  if (porcelain !== null) {
+    for (const wt of parseWorktreeList(porcelain)) {
+      if (wt.branch !== undefined && wt.branch !== '' && !checkedOutByBranch.has(wt.branch)) {
+        checkedOutByBranch.set(wt.branch, wt.path)
+      }
+    }
+  }
+
+  const locals: BranchEntry[] = []
+  const remotes: BranchEntry[] = []
+
+  for (const rawLine of refsRaw.split('\n')) {
+    const line = rawLine.replace(/\r$/, '')
+    if (line === '') continue
+    const [shortName = '', fullRef = '', headMark = '', symref = ''] = line.split('\t')
+    if (shortName === '') continue
+
+    if (fullRef.startsWith('refs/heads/')) {
+      const checkedOutPath = checkedOutByBranch.get(shortName)
+      const entry: BranchEntry = {
+        name: shortName,
+        kind: 'local',
+        ...(headMark === '*' ? { isCurrent: true } : {}),
+        ...(checkedOutPath !== undefined
+          ? { checkedOutWorktreePath: checkedOutPath, checkedOutWorktreeName: basename(checkedOutPath) }
+          : {}),
+      }
+      locals.push(entry)
+    } else if (fullRef.startsWith('refs/remotes/')) {
+      // 跳过 origin/HEAD 等符号引用，避免污染分支下拉框
+      if (symref !== '' || fullRef.endsWith('/HEAD')) continue
+      remotes.push({ name: shortName, kind: 'remote' })
+    }
+  }
+
+  locals.sort((a, b) => {
+    if (a.isCurrent === true && b.isCurrent !== true) return -1
+    if (b.isCurrent === true && a.isCurrent !== true) return 1
+    return a.name.localeCompare(b.name)
+  })
+  remotes.sort((a, b) => a.name.localeCompare(b.name))
+
+  return [...locals, ...remotes]
+}
+
