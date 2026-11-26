@@ -132,4 +132,11 @@
    - `src/sidebar.tsx` 移除 `new-branch-input` 的 `!form.newBranchChecked` 禁用条件。
 4. **验证**：`npm run typecheck && npm test` → `579 tests / 575 pass / 0 fail / 4 skipped`。
 
+### 4.4 目录名拼接规则调整（2026-11-26 第三轮）
+
+- **需求**：新分支命名为 `feature/ios-media-nps` 等带 `/` 的格式时，目录名拼接只取 `/` 后面的内容（即 `<主仓名>-ios-media-nps`）。
+- **实现**：`src/worktree-form.ts#sanitizeWorktreeDirSegment` 去除尾部斜杠后截取最后一个 `/`（或 `\`）后的段再净化。
+- **验证**：`test/worktree-form.test.mjs` Red → Green 后跑全量 `npm run typecheck && npm test`（579 tests / 575 pass / 0 fail / 4 skipped）。
+
+
 

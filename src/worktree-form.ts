@@ -85,9 +85,15 @@ export function joinWorktreePath(location: string, projectName: string): string 
   return loc.endsWith('/') ? `${loc}${name}` : `${loc}/${name}`
 }
 
-/** 与后端 `sanitizeBranchForPath` 同构的分支目录段净化。 */
+/**
+ * 分支目录段净化：若分支名包含 `/`（如 `feature/ios-media-nps`），只取最后一段（`ios-media-nps`），
+ * 再做非法字符净化，避免目录名带上冗余的 `feature-` 等前缀。
+ */
 export function sanitizeWorktreeDirSegment(branch: string): string {
-  const sanitized = branch.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  const withoutTrailingSlash = branch.trim().replace(/[/\\]+$/g, '')
+  const lastSlash = Math.max(withoutTrailingSlash.lastIndexOf('/'), withoutTrailingSlash.lastIndexOf('\\'))
+  const leaf = lastSlash >= 0 ? withoutTrailingSlash.slice(lastSlash + 1) : withoutTrailingSlash
+  const sanitized = leaf.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
   return sanitized === '' ? 'worktree' : sanitized
 }
 

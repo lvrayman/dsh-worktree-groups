@@ -1,6 +1,6 @@
 {
   "name": "dsh-worktree-groups",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "DeepSeek Harness 插件：抢占侧栏 sidebar.workspaces，把会话按 git worktree 三级分组（项目 → worktree → 会话）。",
   "homepage": "https://github.com/lvrayman/dsh-worktree-groups#readme",
   "repository": {

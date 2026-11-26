@@ -98,7 +98,7 @@ test('2026-11-26/AC3 勾选新建分支：空名禁用，输入合法名自动�
   assert.deepEqual(emptyEval.hint, { code: 'newBranchRequired' })
 
   const typed = applyWorktreeFormChange(checked, { newBranch: 'feature/demo' }, REPO, SAMPLE_BRANCHES)
-  assert.equal(typed.projectName, 'dsh-worktree-groups-feature-demo')
+  assert.equal(typed.projectName, 'dsh-worktree-groups-demo')
 
   const validEval = evaluateWorktreeForm(typed, REPO, SAMPLE_BRANCHES)
   assert.equal(validEval.canSubmit, true)
@@ -108,7 +108,7 @@ test('2026-11-26/AC3 勾选新建分支：空名禁用，输入合法名自动�
     branch: 'feature/demo',
     createBranch: true,
     baseRef: 'master',
-    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-feature-demo',
+    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-demo',
   })
 
   // 与已有本地分支重名 ⇒ 禁止提交
@@ -146,7 +146,7 @@ test('2026-11-26/AC3 未勾选新建分支时选择远端分支：无同名本�
     REPO,
     SAMPLE_BRANCHES,
   )
-  assert.equal(remoteOnly.projectName, 'dsh-worktree-groups-feature-remote-only')
+  assert.equal(remoteOnly.projectName, 'dsh-worktree-groups-remote-only')
   const eval1 = evaluateWorktreeForm(remoteOnly, REPO, SAMPLE_BRANCHES)
   assert.equal(eval1.canSubmit, true)
   assert.deepEqual(eval1.payload, {
@@ -154,7 +154,7 @@ test('2026-11-26/AC3 未勾选新建分支时选择远端分支：无同名本�
     branch: 'feature/remote-only',
     createBranch: true,
     baseRef: 'origin/feature/remote-only',
-    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-feature-remote-only',
+    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-remote-only',
   })
 
   // 2) origin/develop：本地已有 develop 且未检出 ⇒ createBranch:false, branch:'develop'
@@ -213,32 +213,36 @@ test('2026-11-26/AC3 校验非法目录名、相对位置与等于主仓路径',
   assert.deepEqual(sameAsMain.hint, { code: 'sameAsMainRepo' })
 })
 
-test('2026-11-26/AC3 工具函数：sanitizeWorktreeDirSegment 与 remoteBranchToLocalName', () => {
-  assert.equal(sanitizeWorktreeDirSegment('feature/foo bar'), 'feature-foo-bar')
+test('2026-11-26/AC3 工具函数：sanitizeWorktreeDirSegment（带 / 只取最后一段）与 remoteBranchToLocalName', () => {
+  assert.equal(sanitizeWorktreeDirSegment('feature/ios-media-nps'), 'ios-media-nps')
+  assert.equal(sanitizeWorktreeDirSegment('team/feature/ios-media-nps'), 'ios-media-nps')
+  assert.equal(sanitizeWorktreeDirSegment('feature/ios-media-nps/'), 'ios-media-nps')
+  assert.equal(sanitizeWorktreeDirSegment('feature/foo bar'), 'foo-bar')
+  assert.equal(sanitizeWorktreeDirSegment('master'), 'master')
   assert.equal(sanitizeWorktreeDirSegment('///'), 'worktree')
   assert.equal(remoteBranchToLocalName('origin/feature/a'), 'feature/a')
   assert.equal(remoteBranchToLocalName('upstream/main'), 'main')
   assert.equal(remoteBranchToLocalName('main'), 'main')
 })
 
-test('2026-11-26/AC3 未勾选新建分支时直接输入新分支名 ⇒ 自动勾选新建分支并联动目录名（对齐 IDEA）', () => {
+test('2026-11-26/AC3 未勾选新建分支时直接输入新分支名 ⇒ 自动勾选新建分支并联动目录名（对齐 IDEA，带 / 只取后缀）', () => {
   const init = createInitialWorktreeForm(REPO, SAMPLE_BRANCHES)
   assert.equal(init.newBranchChecked, false)
 
-  // 未勾选状态直接输入新分支名
-  const typed = applyWorktreeFormChange(init, { newBranch: 'feature/auto-check' }, REPO, SAMPLE_BRANCHES)
+  // 未勾选状态直接输入带 / 的新分支名
+  const typed = applyWorktreeFormChange(init, { newBranch: 'feature/ios-media-nps' }, REPO, SAMPLE_BRANCHES)
   assert.equal(typed.newBranchChecked, true, '输入非空新分支名应自动勾选新建分支')
-  assert.equal(typed.newBranch, 'feature/auto-check')
-  assert.equal(typed.projectName, 'dsh-worktree-groups-feature-auto-check')
+  assert.equal(typed.newBranch, 'feature/ios-media-nps')
+  assert.equal(typed.projectName, 'dsh-worktree-groups-ios-media-nps')
 
   const evalResult = evaluateWorktreeForm(typed, REPO, SAMPLE_BRANCHES)
   assert.equal(evalResult.canSubmit, true)
   assert.deepEqual(evalResult.payload, {
     repoPath: REPO,
-    branch: 'feature/auto-check',
+    branch: 'feature/ios-media-nps',
     createBranch: true,
     baseRef: 'master',
-    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-feature-auto-check',
+    targetPath: '/Users/dev/Documents/Project/DSH/dsh-worktree-groups-ios-media-nps',
   })
 
   // 仅输入空白不应自动勾选
